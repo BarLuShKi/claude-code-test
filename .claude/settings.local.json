@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git --version)",
+      "Bash(gh --version)",
+      "Bash(gh auth *)",
+      "Bash(fswatch --version)",
+      "Bash(brew install *)",
+      "Bash(git init *)",
+      "Bash(gh repo *)",
+      "Bash(chmod +x *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(nohup ./auto-push.sh)",
+      "Bash(echo \"Watcher PID: $!\")",
+      "Bash(kill 53601)",
+      "Bash(launchctl load *)",
+      "Bash(launchctl list *)"
+    ]
+  }
+}
