@@ -403,3 +403,571 @@ Columns: **Tier** (§1.6) · **Plane** (D=data, C=control/status) · **RT class*
 ## Verification (Section 3)
 - Cross-check every §2 cross-cutting concern maps to an owning module (TimeAuthority↔Transport, event bus↔EventBus, trust boundary↔NetworkControlGateway, lifecycle↔AppCoordinator, backpressure↔CaptureEngine+Telemetry).
 - Confirm the MVP-phase set is small (the Tier-0 row + SessionModel/CommandService/GUI/AppCoordinator) and nothing MVP-tagged depends on a Later-tagged module.
+
+---
+---
+
+# Section 4 — Risk Analysis: Adversarial Review & Hardening
+
+## Context
+Original had a 12-row risk table (R1–R12) plus a throughput sanity note. Good start, but it conflates probability with impact, omits whole risk classes, and has no scoring or ownership.
+
+## Part A — Adversarial Review
+- **A1 (High) No likelihood × impact scoring or residual risk.** A flat table can't prioritize. → Add Likelihood/Impact/Exposure + residual-after-mitigation columns.
+- **A2 (High) Missing risk classes:** clock-domain drift between sample-clock and LTC; **CoreAudio buffer-size renegotiation** mid-session; macOS **App Nap/sleep/Gatekeeper/permission** prompts stealing focus mid-record; **thermal throttle on a fanless-feel mini under sustained 128ch**; **memory fragmentation over multi-day runs**; **JUCE/3rd-party version regressions**; **filesystem choice (APFS vs exFAT)** behavior on power loss; **NTP step / DST** corrupting naming; **solo-dev bus factor** (no second maintainer).
+- **A3 (Med) No owner / no trigger / no detection per risk.** Mitigation listed, but not *how we detect it occurred* nor *who/what monitors it*. → Tie each risk to a HealthMonitor signal + EventLog code.
+- **A4 (Med) No "accepted risks" register.** Some risks are deliberately accepted for v1 (e.g., no A/B chase). Should be explicit, not silent.
+- **A5 (Med) Throughput note understates the real enemy.** Bandwidth is trivial; the note should foreground **latency-spike distribution (p99/p999 write latency)** and **FIFO high-watermark** as the true risk metric.
+- **A6 (Low) No risk re-review cadence.** Risks should be revisited at each phase gate.
+
+## Part B — Hardened Section 4
+**Scoring:** each risk = Likelihood(L/M/H) × Impact(L/M/H) → Exposure, with a detection signal, owner module, and residual rating.
+
+| ID | Risk | L×I | Detection signal | Owner | Residual |
+|---|---|---|---|---|---|
+| R1 | RT-safety violation (alloc/lock in callback) | M×H | RT-guard trap; callback-duration p999 | CaptureEngine/Telemetry | Low |
+| R2 | Disk latency spike / stall | H×H | FIFO high-watermark; write p99/p999 | DiskWriterPool/Health | Med |
+| R3 | Device hot-unplug / SR change mid-record | M×H | CoreAudio property listener event | AudioDeviceManager | Med |
+| R4 | Aggregate-device clock drift | M×H | inter-device drift estimate | AudioDeviceManager | Med |
+| R5 | LTC decode error at edges | M×M | LTC discontinuity/rate events | LTCEngine | Low |
+| R6 | RF64/>4GB transition corruption | L×H | golden-file CI; size-threshold log | DiskWriterPool | Low |
+| R7 | Crash/power loss → unusable files | M×H | repair-on-launch outcome | RecoveryJournal | Low |
+| R8 | UI/dashboard back-pressure stalls engine | L×H | engine never reads UI; assert in tests | Engine façade | Low |
+| R9 | Thermal throttle at 128ch sustained | M×M | SMC temp/throttle telemetry | HealthMonitor | Med |
+| R10 | Solo-dev scope/maintenance/bus-factor | H×M | phase-gate burndown | AppCoordinator/owner | Med |
+| R11 | Naming collision / invalid path | M×M | dedupe/sanitize unit+property tests | NamingEngine | Low |
+| R12 | Mirror failure mishandled (future) | M×M | mirror-status heartbeat | MirrorWriter | Med |
+| R13 | NTP step / DST corrupts naming/midnight | M×M | wall-clock jump detector | TimeAuthority | Low |
+| R14 | macOS update/permission/sleep interrupts run | M×H | sleep/AppNap inhibitor + power state | AppCoordinator | Med |
+| R15 | Multi-day memory fragmentation/leak | M×H | RSS trend in soak | HealthMonitor/Telemetry | Med |
+| R16 | 3rd-party (JUCE/libltc) regression | L×M | pinned versions + CI golden | build | Low |
+
+**Accepted risks (v1):** no A/B chase-sync; single-process UI (Tier-2 isolation deferred per §2); aggregate-device support discouraged not blocked.
+**Cadence:** re-score at every phase gate; promote any "Med" residual touching Tier-0 to a blocking item.
+
+## Verification (S4)
+Every R# maps to a detection signal that exists in HealthMonitor/Telemetry/EventLog; no Tier-0 risk left at residual ≥ Med without a phase-gate action.
+
+---
+---
+
+# Section 5 — Data Model: Adversarial Review & Hardening
+
+## Context
+Original gave a `Project→Session→Recording(Take)→FileSegment` hierarchy plus Marker/EventLog/Counters, with JSON for config/presets and SQLite for journal/log/markers.
+
+## Part A — Adversarial Review
+- **A1 (Critical) No schema versioning / migration** on any entity — early files break on upgrade (echoes §2 A12).
+- **A2 (High) Continuous-mode mismatch.** The model is take-centric; reality/live **continuous** recording (per §1.4) has no clean representation — a 12-hour continuous record isn't really a "Take." → Need a `Recording` that supports both bounded takes and open-ended continuous spans, with segments as the real unit.
+- **A3 (High) Identity & references fragile.** Implicit IDs; no stable UUIDs, no referential integrity rules, no "what happens to FileSegment if Track is deleted mid-session." → UUIDs everywhere + defined cascade/orphan rules.
+- **A4 (High) Time representation ambiguous.** `startTC` + `startSampleSinceMidnight` + `startWallClock` can disagree; no single canonical time anchor or rate/df flags at the right level. → Canonical anchor = sample-count from TimeAuthority; TC/wall derived; store rate+df per Recording.
+- **A5 (Med) No append-only/event-sourced separation.** Mixing durable recording facts (immutable once written) with mutable config in the same store risks corrupting history. → Separate **immutable recording ledger** (segments/markers/events, SQLite WAL) from **mutable session config** (JSON).
+- **A6 (Med) Channel-map / routing under-modeled** for poly groups and source-name provenance (Dante name vs user name).
+- **A7 (Med) No relationship to crash-recovery state machine** — the journal needs explicit per-segment status (open/closing/closed/finalized/orphaned).
+- **A8 (Low) Custom metadata fields typing** unspecified (string vs typed); affects iXML mapping + validation.
+
+## Part B — Hardened Section 5
+**Two stores:**
+- **Mutable config (JSON, versioned):** `Project, Session, DeviceConfig, TrackConfig, MetadataSet+templates, NamingTemplate, FolderTemplate, Preset, Counters.config`.
+- **Immutable ledger (SQLite WAL):** `Recording, FileSegment, Marker, EventLogEntry, CounterAllocation`.
+
+**Every entity:** `id: UUID`, `schemaVersion`, `createdAt`. Migrations are forward-only with a version registry.
+
+**Canonical time:** TimeAuthority `sampleCount` is the anchor; `FileSegment.startSample` is authoritative; TC and wall-clock are derived/recorded-for-reference. `Recording { mode: take|continuous, frameRate, dropFrame, startSample, endSample?|open }`.
+
+**Segment lifecycle status:** `open → closing → closed → finalized | orphaned` (drives recovery).
+
+**Referential rules:** TrackConfig edits during record apply to *future* segments only; deleting a track mid-session is blocked while armed; FileSegments reference Track by UUID + a frozen snapshot of name/source at open time (provenance preserved even if track later renamed).
+
+**Source provenance:** TrackConfig stores `{ userName, sourceName (device/Dante), deviceChannel }` distinctly.
+
+**Custom fields:** typed (`string|number|enum|date`) for clean iXML mapping + validation.
+
+## Verification (S5)
+Round-trip a session through save→quit→reload with a schema bump and confirm migration; simulate kill-9 mid-segment and confirm ledger status + recovery reconstruct a valid file.
+
+---
+---
+
+# Section 6 — Audio Pipeline: Adversarial Review & Hardening
+
+## Context
+Original: single CoreAudio device (aggregate discouraged), allocate-everything-at-arm, RT callback does delay→gain→bypass→meter/clip tap→FIFO push, with sample-accurate LTC↔sample stamping; meter post-gain.
+
+## Part A — Adversarial Review
+- **A1 (Critical) Variable/!=expected buffer size & SR changes** not handled in the callback contract. CoreAudio can deliver variable frame counts and renegotiate. Pre-sized buffers assuming fixed N break. → Callback must handle any frame count ≤ a pre-allocated max; SR change triggers a controlled stop+re-arm, never an in-place realloc.
+- **A2 (High) Pre-record buffer absent from the pipeline** (added in §1.5/§3) — must be a continuously-running ring even when not recording. → Standby fills PreRecordBuffer; on record, drain pre-roll into segment with sample-accurate stitch.
+- **A3 (High) Delay 0–500ms memory at 128ch.** 500ms @ 192kHz @ 128ch @ float = ~49 MB — fine, but must be allocated at arm and **zeroed** to avoid garbage on first reads; delay-change-while-recording policy undefined (click-free?). → Delay changes apply at segment boundaries or with a crossfade; never realloc in RT.
+- **A4 (High) Gain smoothing & dB→linear** must be precomputed and ramped to avoid zipper noise; bypass must be click-free. → One-pole/linear ramp per block; bypass = ramped, not hard switch.
+- **A5 (Med) Meter tap point is a policy decision, not a default.** Post-gain reflects recording; many ops want **pre-fader input** to see true input. → Provide both taps; default = recorded (post-gain) with a switch (ties §1 A10).
+- **A6 (Med) Multi-device reality.** "Single device" is clean but Dante (64ch) + built-in LTC input is a common 2-device need. Aggregate has drift (R4). → Support a **primary capture device + a separate, independently-clocked LTC/aux input** read on its own callback, correlated via TimeAuthority — avoids aggregating the main capture clock.
+- **A7 (Med) Denormals** can spike CPU in delay/gain math. → Enable FTZ/DAZ on the audio thread.
+- **A8 (Low) Channel count > device channels / sparse arming** mapping validation belongs here.
+
+## Part B — Hardened Section 6
+**Device model:** one **primary clocked capture device**; optional **secondary aux device** (LTC/built-in) on its own callback, never aggregated into the capture clock; both correlated through **TimeAuthority** sample stamping.
+
+**Arm-time allocation (RT-free thereafter):** per-track delay lines (max 500ms @ session SR, zeroed), gain ramp state, capture SPSC FIFOs (seconds of headroom), PreRecordBuffer ring, meter/clip atomics.
+
+**Callback (handles any frame count ≤ max; FTZ/DAZ on):**
+```
+for each armed track:
+  read source channel(s)
+  DELAY  (read offset; changes only at boundary/crossfade)
+  GAIN   (ramped dB→lin)  [BYPASS = ramped]
+  meter+clip tap (post-gain default; pre-fader tap optional)
+  push → capture FIFO  (and always → PreRecordBuffer in Standby/Record)
+stamp sampleCount → TimeAuthority; publish FIFO HWM + callback duration → Telemetry
+```
+**SR/buffer change:** detected on message thread → controlled stop + re-arm (no in-place realloc); logged as event.
+**No alloc/lock/syscall/exception in callback** (enforced by RT-guard).
+
+## Verification (S6)
+Feed variable frame sizes + a mid-session SR change via the mock device; assert no realloc, click-free gain/bypass ramps (spectral check), correct pre-roll stitch, and FTZ active (denormal stress test shows no CPU spike).
+
+---
+---
+
+# Section 7 — Disk Writing Pipeline: Adversarial Review & Hardening
+
+## Context
+Original: small writer pool (2–4), large aligned writes, F_PREALLOCATE, crash-valid header patching, bounded fsync, auto-RF64, gapless rollover (open-before-close), mirror best-effort.
+
+## Part A — Adversarial Review
+- **A1 (Critical) Pool→file assignment & ordering** unspecified. 128 files across 2–4 threads needs a defined, contention-free partition and per-file write ordering guarantee (no interleaved partial frames). → Static partition: each file owned by exactly one writer; per-file monotonic write cursor.
+- **A2 (High) fsync cadence vs latency spike conflict.** Periodic fsync *is itself* the latency spike (R2). → Decouple: data writes are frequent+buffered; **fsync on a separate cadence/thread**, and header-size patches use small targeted writes; consider `F_FULLFSYNC` only at finalize, not periodically.
+- **A3 (High) Crash-valid header strategy under-specified for RF64.** Patching RIFF size + `ds64` mid-stream must be atomic-enough that a crash between data-write and size-patch still yields a recoverable file. → Write data first, advance a *known-good* size marker on a cadence; recovery computes true size from file length if patch lagged.
+- **A4 (High) Auto-RF64 decision timing.** Deciding at open from a *projection* can be wrong (rollover changes duration). Switching WAV→RF64 mid-file is impossible. → Default to RF64-capable header when projected OR when rollover policy could exceed 4GB OR sample-rate/channel/duration unknown-but-large; otherwise plain WAV. Bias toward RF64 when uncertain.
+- **A5 (Med) Gapless rollover sample-accuracy** needs the exact boundary sample defined by TimeAuthority (esp. for TC-boundary rollover) and metadata/counter carry — but also must not double-count or drop the boundary sample.
+- **A6 (Med) Mirror write coupling.** If mirror shares the same FIFO consumption, a slow mirror disk back-pressures primary. → Mirror reads from its **own** tap/FIFO; mirror failure isolates fully.
+- **A7 (Med) Disk-full handling** mid-write: must stop the affected destination gracefully, keep the other (mirror) going, finalize a valid truncated file, raise CRITICAL.
+- **A8 (Low) Filesystem specifics:** APFS sparse/preallocation behavior, exFAT 4GB limit (forces RF64 / split), volume format detection feeds Destination policy.
+
+## Part B — Hardened Section 7
+**Pool:** static file→writer partition (one owner per file, balanced by track count); per-file monotonic cursor; large aligned buffered writes.
+**Durability ladder:** (1) frequent buffered data writes; (2) periodic **known-good size marker** + light header patch; (3) `fsync` on a separate low-priority cadence; (4) `F_FULLFSYNC` only at finalize. Recovery trusts file length when a patch lagged.
+**Format:** prefer **RF64 header when uncertain/large**; plain WAV only when provably <4GB across the rollover policy; exFAT volumes force RF64/split.
+**Rollover (gapless):** TimeAuthority gives the exact boundary sample; open+preallocate next segment before closing current; carry metadata + increment segment counter; boundary sample written exactly once.
+**Mirror:** independent tap/FIFO/threads; failure raises status, never back-pressures primary.
+**Disk-full:** finalize valid truncated file on the failed volume, continue others, raise CRITICAL + EventLog.
+
+## Verification (S7)
+Kill-9 between data-write and size-patch → recovery yields a playable file; fill the primary volume mid-record → mirror continues, primary finalizes valid; force a TC-boundary rollover → byte-exact, no dropped/duplicated boundary sample (golden-file compare).
+
+---
+---
+
+# Section 8 — LTC Architecture: Adversarial Review & Hardening
+
+## Context
+Original: libltc decode off the RT thread via a dedicated tap FIFO; continuous decode; all 7 rates incl. DF/NDF; dropout/discontinuity/rate/midnight detection; sample-accurate `TimeReference`; jam-on-lock; event logging.
+
+## Part A — Adversarial Review
+- **A1 (Critical) Sample-accurate audio↔TC correlation is the crux and is hand-waved.** "Stamp the sample index" must define *which* sample maps to *which* LTC frame edge, accounting for the LTC reader's internal latency and the aux-device clock offset (§6 A6). Error here = wrong `TimeReference`. → Define correlation at the **LTC frame-start edge**, store (sampleCount, tc) pairs, and fit a line to reject jitter.
+- **A2 (High) Drift between LTC source clock and capture clock** (separate devices) accumulates over hours. A single offset isn't enough. → Continuously estimate **rate ratio** (LTC frames vs capture samples), not just offset; flag drift beyond tolerance.
+- **A3 (High) Half-frame / direction / varispeed / jam vs free-run** edge cases. LTC can run backwards (rewind), pause, or varispeed; the decoder must not interpret these as corruption. → State a TC-state model: `locked, free-running(flywheel), paused, reverse, no-signal`; flywheel TC across short dropouts.
+- **A4 (High) Midnight vs corruption disambiguation needs precise rule.** `23:59:59:max→00:00:00:00` valid only if it matches expected +1 frame at the detected rate; anything else = discontinuity. → Encode exact expected-next-frame arithmetic per rate/df.
+- **A5 (Med) DF/NDF detection & mismatch with project setting.** Must auto-detect drop-frame from the stream (DF flag bit + skipped frame numbers) and reconcile with user setting; mismatch is a WARNING, not silent.
+- **A6 (Med) LTC level/quality** (too hot/clipped, too low, wrong channel) — operator needs a confidence/quality indicator, not just lock/no-lock.
+- **A7 (Med) What TC anchors a file** when LTC is absent at record start but arrives later, or vice-versa. → Define fallback: time-of-day from system clock with a "TC=ToD (no LTC)" flag; back-fill not allowed (immutable header) but logged.
+- **A8 (Low) Frame-rate of 23.976/29.97** are non-integer; sample-per-frame is fractional → must use rational arithmetic, not rounded.
+
+## Part B — Hardened Section 8
+**Correlation:** decode on a dedicated thread from an aux/selected-channel tap; for each frame, record `(sampleCount_at_frame_start, tc)` corrected for reader latency; **least-squares fit** over a sliding window yields offset **and rate-ratio** (drift), with jitter rejection. `TimeReference` (samples since midnight) computed from the fit at each segment's start sample using **rational** sample/frame math.
+**TC state machine:** `no-signal → locking → locked → flywheel(short loss) → discontinuity/rate-change/paused/reverse`, each emitting EventBus events; flywheel maintains TC across brief dropouts using the last good rate.
+**Midnight rule:** rollover accepted only when it equals the exact expected next frame for the detected rate+df; else discontinuity.
+**DF/NDF:** auto-detect from stream; mismatch vs project = WARNING.
+**Quality:** report LTC level/SNR/lock-confidence to HealthMonitor.
+**No-LTC fallback:** anchor to system ToD with explicit flag; immutable, logged.
+
+## Verification (S8)
+Synthetic corpus: all 7 rates, drift (±50ppm), short dropouts (flywheel), reverse, pause, varispeed, exact midnight, near-midnight corruption, DF/NDF mismatch, hot/low level. Assert `TimeReference` sample-accuracy vs ground truth and correct state transitions/events.
+
+---
+---
+
+# Section 9 — Metadata Architecture: Adversarial Review & Hardening
+
+## Context
+Original: typed field model; cascade Project→Session→Track; live-edit policy (future segments); BWF `bext` now, iXML designed-now-built-later; track names feed naming.
+
+## Part A — Adversarial Review
+- **A1 (High) iXML "future" is a mistake for the broadcast audience.** iXML is the de-facto post hand-off standard (scene/take/track names, sync, notes); deferring it undercuts Pillar 6 (interoperability). → Promote iXML write to **early** (alongside BWF), at least the core schema (PROJECT/SCENE/TAKE/TAPE/NOTE/TRACK_LIST/SPEED).
+- **A2 (High) bext is size-limited & encoding-constrained** (256-char Description, ASCII/Latin-1, fixed fields). Rich/Unicode metadata won't fit → must map cleanly: short canonical fields → bext, full set → iXML. → Define the explicit field→bext vs field→iXML mapping + truncation rules.
+- **A3 (High) Live-edit concurrency.** Editing metadata on the message thread while writers embed headers per-segment needs a defined snapshot point: each segment freezes a metadata snapshot at open. → "Metadata applies at next segment open" with a frozen snapshot; current segment immutable.
+- **A4 (Med) Poly vs mono metadata.** TRACK_LIST/CHANNEL mapping differs (one file many channels vs many files). iXML TRACK_LIST must reflect interleave order; per-mono-file gets its single channel entry.
+- **A5 (Med) UMID / OriginatorReference / CodingHistory** generation rules unspecified (uniqueness, recorder ID, format string). → Define generators.
+- **A6 (Med) Validation & required-field policy** before record (e.g., empty Scene/Take) — warn vs block, configurable.
+- **A7 (Low) Sidecar export** (CSV/JSON per daily folder) for NLEs/sound report apps not mentioned — cheap, high post value.
+- **A8 (Low) Field i18n/encoding** for international crews → UTF-8 in iXML, transliterate for bext.
+
+## Part B — Hardened Section 9
+**Model:** typed fields (`string|number|enum|date`), templates, cascade Project→Session→Track→(segment snapshot).
+**Embedding (early, not deferred):**
+- **bext:** Description (≤256, transliterated), Originator, OriginatorReference (generated), OriginationDate/Time, **TimeReference** (from TimeAuthority), CodingHistory, UMID.
+- **iXML (core, early):** PROJECT, SCENE, TAKE, TAPE/ROLL, NOTE, SPEED (rate/df/TimeReference), TRACK_LIST (interleave-correct for poly; single for mono), plus custom fields.
+- **Sidecar:** per-daily-folder CSV/JSON sound report.
+**Live-edit:** changes apply at **next segment open** via a frozen snapshot; current/written segments immutable.
+**Generators:** UMID/OriginatorReference/CodingHistory deterministic from recorder ID + session + timestamp.
+**Validation:** configurable required-field policy (warn default, block optional) checked at arm/record.
+
+## Verification (S9)
+Validate output with **BWF MetaEdit + ffprobe + an iXML-aware tool**; confirm bext/iXML agreement, correct TRACK_LIST for mono vs poly, Unicode survives in iXML and is sanely transliterated in bext, and a mid-record metadata edit only affects subsequent segments.
+
+---
+---
+
+# Section 10 — Naming Engine: Adversarial Review & Hardening
+
+## Context
+Original: one token engine for files + folders; ordered Token|Literal templates; tokens from metadata+counters+TC+device; visual drag-drop builder; live preview; sanitize; duplicate protection; folder templates with auto/ask/disable + midnight handling.
+
+## Part A — Adversarial Review
+- **A1 (High) Token resolution timing & immutability.** A filename built from live counters/TC must be resolved **once** at segment open and frozen; re-resolving later (e.g., after a counter change) would rename or mismatch the journal. → Resolve-once-at-open, store the resolved name in the ledger.
+- **A2 (High) Duplicate protection across rollover/mirror/crash-recovery.** Auto-suffix must be collision-safe against existing files on disk *and* the in-flight ledger *and* the mirror volume — not just within the session. → Check disk + ledger + mirror; reserve the name atomically before open.
+- **A3 (High) Cross-platform / FS sanitization depth.** macOS allows `/` issues, leading dots, length limits (255 bytes UTF-8), reserved names, trailing spaces; exFAT/Windows interop (for delivery) bans `:*?"<>|`. → Sanitize to the **strictest common** profile when delivery target unknown; configurable.
+- **A4 (Med) Empty/missing token values** (e.g., no Scene) produce ugly `__` or stray separators. → Define empty-token policy: collapse adjacent separators, optional placeholder, warn.
+- **A5 (Med) Poly file naming vs per-track {TrackName}.** A poly file has many tracks; `{TrackName}` is ambiguous. → Token set scoped: file-level tokens vs track-level tokens; `{TrackName}` only valid in mono mode (validate template against mode).
+- **A6 (Med) Counter/token interplay with TimeAuthority** for `{TCStart}` — must use the same frozen start sample as the file header (§7/§8).
+- **A7 (Low) Template versioning/sharing** across presets; invalid-token detection when a template references a removed custom field.
+
+## Part B — Hardened Section 10
+**Resolution:** at segment open, resolve template once against frozen {metadata snapshot, counter allocation, TimeAuthority TCStart, device}; store resolved path in ledger (immutable). `{TCStart}` shares the header's start sample.
+**Collision safety:** atomic name reservation checked against disk + ledger + mirror; deterministic suffix (`_dupN`) only after a real collision.
+**Sanitize:** strictest-common profile (macOS + Windows/exFAT delivery), 255-byte cap, reserved-name/leading-dot/trailing-space handling; configurable strictness.
+**Empty tokens:** collapse separators + optional placeholder + warn.
+**Mode-aware tokens:** file-level vs track-level token scopes; template validated against mono/poly and against available custom fields; live preview shows resolved + sanitized result with warnings.
+**Folders:** same engine; auto/ask/disable; midnight creates next daily folder without breaking an in-progress segment (new segment lands in new folder, prior segment stays).
+
+## Verification (S10)
+Property tests: random metadata/counters → always FS-valid, never collides (incl. simulated existing files + mirror), poly templates reject `{TrackName}`, midnight crossing places segments correctly, `{TCStart}` matches the file's bext TimeReference.
+
+---
+---
+
+# Section 11 — GUI Architecture: Adversarial Review & Hardening
+
+## Context
+Original: MVVM bound to snapshots; main screen (status/TC/duration/LTC/device/disk/remaining + virtualized 128-row track list w/ name/delay/gain/meter/arm); meters from decimated atomics on ~30Hz timer; Dark/Light; Lock + Record-Safe enforced in command layer.
+
+## Part A — Adversarial Review
+- **A1 (High) 128-row meter rendering performance** on the message thread can starve UI/cause dropped frames; JUCE component-per-cell at 128×(meter+controls) is heavy. → Virtualize *and* render meters in a single OpenGL/Metal-backed meter view (one component drawing all visible bars), not 128 components; cap redraw to visible rows.
+- **A2 (High) Snapshot/meter consumption must never block or allocate on the UI tick** and must tolerate the engine racing ahead. → UI reads triple-buffered status + meter atomics; never locks; missed frames are fine (latest-wins).
+- **A3 (High) Lock/Record-Safe UX correctness.** Graying buttons isn't enough (§2): but the GUI must also *reflect* gating state unambiguously and provide the deliberate unlock workflow without being defeated by keyboard focus. → Visible mode banners + confirm/hold-to-unlock; all actions route to CommandService which is the real gate.
+- **A4 (Med) Accessibility/at-a-distance legibility** (§1.11): colorblind-safe meter palettes, large-mode, high-contrast, VoiceOver labels — not addressed.
+- **A5 (Med) Error/event surfacing without alarm fatigue** (§12): the UI needs a non-modal, filterable notification area driven by the EventBus/HealthMonitor, never modal dialogs that block during record.
+- **A6 (Med) Multi-window / external display** (control room often uses a big meter wall + an operator panel). → Support a detachable full-screen meter/status view.
+- **A7 (Med) Live-edit fields while recording** must visibly indicate "applies to next segment" (§9 A3) to avoid operator confusion.
+- **A8 (Low) State restoration / window layout persistence** and per-user layouts.
+
+## Part B — Hardened Section 11
+**Pattern:** MVVM; ViewModels subscribe to triple-buffered status snapshots + the EventBus; commands out via CommandService only.
+**Rendering:** virtualized track list (visible rows only); **GPU-backed single meter view** drawing all visible bars (Metal/OpenGL via JUCE) to hold 128 channels at a configurable 30–60Hz; UI tick is lock-free, alloc-free, latest-wins.
+**Main screen:** record status, TC (from TimeAuthority), duration, LTC status+quality, device status, disk remaining + remaining-time estimate, virtualized track list (name, source, delay, gain, meter, arm, clip).
+**Modes:** Lock + Record-Safe shown as persistent banners with deliberate **hold-to-unlock/confirm**; real enforcement in CommandService (covers keyboard/StreamDeck/OSC/HTTP).
+**Notifications:** non-modal, filterable, level-colored area fed by EventBus/HealthMonitor; **no blocking modals during record**.
+**Accessibility:** colorblind-safe palettes, high-contrast + large modes, VoiceOver labels, at-a-distance meter mode.
+**Windows:** detachable full-screen meter/status view for control-room displays; layout persistence.
+**Live-edit affordance:** fields editable during record show an "applies next segment" hint.
+
+## Verification (S11)
+Drive 128 channels of synthetic meter data and confirm sustained 60Hz with no UI-thread allocation/locks (instrument the tick); attempt every protected action via UI/keyboard during Record-Safe and confirm all are gated by CommandService; colorblind palette + VoiceOver pass.
+
+---
+---
+
+# Section 12 — Health Monitoring: Adversarial Review & Hardening
+
+## Context
+Original: sampler thread reads CPU/RAM/disk/FIFO/device/LTC/clip; INFO/WARNING/CRITICAL with hysteresis + dwell + rate-limit; clipping classified single/repeated/sustained; silence detection optional default-off; transitions logged.
+
+## Part A — Adversarial Review
+- **A1 (High) "Health" must distinguish capture-fatal from cosmetic.** A CRITICAL on the dashboard ≠ a CRITICAL on FIFO overflow. Levels alone don't encode the **failure tier** (§1.6). → Cross every signal with its tier; only Tier-0/1 signals can raise CRITICAL that demands operator action.
+- **A2 (High) The real leading indicator is FIFO high-watermark + write p99/p999**, not CPU%. CPU can look fine while a disk stall is about to overflow. → Make FIFO HWM and write-latency percentiles the primary Tier-0 health metrics with predictive (trend) warnings before overflow.
+- **A3 (Med) Sampler cadence vs cost.** Sampling SMC temps / disk stats too often is itself overhead; too rarely misses spikes. → Tiered cadence: fast (FIFO/clip, ~10–20Hz via atomics, near-free) vs slow (CPU/RAM/temp/disk, ~1Hz).
+- **A4 (Med) Hysteresis params per-signal, not global**; clip vs thermal vs disk need different enter/exit/dwell. → Per-signal threshold config + sane defaults.
+- **A5 (Med) Alarm persistence & acknowledgement.** Operators need ack/snooze and a "still active" indication, plus a post-session health summary for the report. → Ack/snooze + latched-until-cleared + session health summary export.
+- **A6 (Med) Clip classification needs sample-true detection** (inter-sample peaks / sustained-over-N-samples) from the RT tap, not RMS guesses. → True-peak-ish + consecutive-over-threshold counting in RT; classify off-thread.
+- **A7 (Low) Self-health of the monitor** (did the sampler thread stall?) — watchdog.
+- **A8 (Low) Thermal action policy:** warn only, or also suggest reducing channels/SR? Document recommended operator action per CRITICAL.
+
+## Part B — Hardened Section 12
+**Signal taxonomy:** each signal tagged {tier, cadence-class, level-policy}. Tier-0 leading indicators = **FIFO HWM, write p99/p999, callback-duration p999, xrun count**; Tier-1 = device/LTC status, mirror status, RSS trend; Tier-2 = dashboard/export/network.
+**Cadence:** fast loop (atomics, ~10–20Hz) for FIFO/clip/callback; slow loop (~1Hz) for CPU/RAM/temp/disk.
+**Leveling:** per-signal enter/exit/dwell hysteresis + rate-limit/coalesce; **predictive** warnings on FIFO/latency trend before overflow.
+**Clipping:** RT counts consecutive-over-threshold + peak; off-thread classifies single/repeated/sustained → WARNING-system. Silence detection optional, default-off.
+**Operator UX:** ack/snooze, latched-active indication, recommended action per CRITICAL; **session health summary** appended to the sound report.
+**Self-watchdog:** monitor liveness check; missed sampler ticks raise a meta-warning.
+
+## Verification (S12)
+Inject a slow-disk ramp and confirm a predictive WARNING fires *before* FIFO overflow; verify clip classifier on crafted waveforms; confirm a dashboard crash raises only a Tier-2 INFO/WARNING (never a capture-critical alarm); health summary exports.
+
+---
+---
+
+# Section 13 — Remote Dashboard: Adversarial Review & Hardening
+
+## Context
+Original: read-only embedded HTTP + WebSocket/SSE on a low-priority thread serving the status snapshot; zero RT impact; LAN-bound; optional token auth; assets shareable with in-app web layer.
+
+## Part A — Adversarial Review
+- **A1 (High) "Zero RT impact" must be structurally guaranteed, not promised.** An in-process server shares the address space with capture; a bug/leak/crash there can still hurt Tier-0 (contradicts §2 A8). → Run the dashboard **out-of-process (XPC/child)** reading a shared read-only snapshot (shared memory or a one-way pipe); a dashboard crash cannot touch capture.
+- **A2 (High) Back-pressure & many clients.** Slow/many WebSocket clients must never queue unbounded in the capture process. → Server holds only the latest snapshot (drop-old), bounded per-client buffers, capped client count.
+- **A3 (Med) Security surface.** "Optional token auth" on a broadcast LAN is weak; OB trucks/venues have hostile networks. → Default-on token, bind to explicit interface, optional TLS, read-only by construction (no control path), rate-limit, off-by-default.
+- **A4 (Med) Snapshot rate vs cost.** Pushing full 128-ch meters to phones at 60Hz is wasteful/janky on cellular. → Adaptive: status at 1–4Hz, meters summarized (e.g., over/peak flags + reduced rate), client-negotiated.
+- **A5 (Med) Discovery & resilience.** mDNS/Bonjour for finding the recorder; auto-reconnect; show "stale data" if the feed drops (never imply all-good when disconnected).
+- **A6 (Low) Multi-recorder aggregation** (control room with several recorders) — design the snapshot schema to be recorder-identified for future aggregation.
+
+## Part B — Hardened Section 13
+**Process model:** dashboard server is an **isolated child process**; it maps a **read-only latest-snapshot** (shared memory / one-way IPC) published by the engine; no IPC path allows control or write-back. A crash/leak there is invisible to capture.
+**Transport:** HTTP for assets, WebSocket/SSE for push; **latest-wins**, bounded per-client buffers, max-client cap; adaptive rates (status 1–4Hz, summarized meters); "stale/disconnected" state shown explicitly.
+**Security:** off by default; when on — token auth, explicit interface bind, optional TLS, rate-limit; structurally read-only.
+**Discovery:** Bonjour/mDNS advertise; client auto-reconnect.
+**Schema:** recorder-identified snapshot (future multi-recorder aggregation).
+
+## Verification (S13)
+Kill the dashboard child mid-record → capture unaffected, auto-respawn; connect 50 throttled clients → capture-process memory/CPU flat; pull the network → clients show "stale," not green; confirm no endpoint can issue a command.
+
+---
+---
+
+# Section 14 — Playback / Spot-Check: Adversarial Review & Hardening
+
+## Context
+Original recommendation: integrate as an isolated "Review" mode in the same app (not a separate binary), disabled while recording; own PlaybackEngine + audio path; select take, scrub, solo/group, cached-peak waveform; not a DAW; future companion via journal if needed.
+
+## Part A — Adversarial Review
+- **A1 (High) "Same app" vs "Capture is sacred" tension.** Even disabled-during-record, playback code in-process can crash the recorder when *not* recording but a session is loaded. Risk is lower (not armed) but non-zero. → Acceptable for v1 *if* playback strictly cannot initialize while armed/recording and shares no RT structures; revisit out-of-process if instability appears.
+- **A2 (High) Device contention** (§3 A11): playback output device vs capture input device. On one interface, opening output may renegotiate the device. → Playback acquires output **only after** capture is fully released; never co-resident; explicit mutual-exclusion in AppCoordinator.
+- **A3 (Med) Reading files still being written** (spot-check a prior segment while recording continues) — the original disables all playback during record, but operators often want to verify the *last completed* take while still rolling. → Allow read-only playback of **finalized** segments on a separate output device during record, *if* hardware allows; otherwise disabled. Make it a capability check, not a blanket ban.
+- **A4 (Med) Waveform peak generation cost** for long files (multi-hour) — must be cached/lazy/background, never block UI, never compete with writers. → Background peak cache, lazy per-view, throttled, lower priority than writers.
+- **A5 (Low) Scope creep guard** — solo/group, scrub is fine; resist adding fades/edits/markers-editing that drift toward a DAW.
+
+## Part B — Hardened Section 14
+**Recommendation (confirmed, refined):** **integrated isolated Review mode**, *not* a separate binary — single codebase for a solo dev, shares the session/ledger model directly. **Hard isolation:** separate PlaybackEngine, separate output-device acquisition, no shared RT structures, and AppCoordinator enforces mutual exclusion with capture.
+**During record:** allow read-only spot-check of **finalized** segments **only if** a distinct output path is available (capability-gated); never touch in-flight segments or the capture device; default off if hardware can't guarantee isolation.
+**Waveform:** background, cached, lazy, throttled, lower-priority-than-writers peak generation.
+**Scope:** select/scrub/solo/group + optional waveform. Explicitly not an editor.
+**Escalation path:** if in-process playback ever proves destabilizing, promote to an out-of-process companion reading the ledger read-only (reserve the seam).
+
+## Verification (S14)
+Confirm playback cannot initialize while armed; on a single interface, verify capture-release→playback-acquire ordering with no glitch; spot-check a finalized segment during an active record on a 2-device rig with zero capture impact; verify peak generation never raises writer latency.
+
+---
+---
+
+# Section 15 — Technology Stack: Adversarial Review & Hardening
+
+## Context
+Original recommendation: **JUCE 8 + C++** single toolchain for engine + UI (custom LookAndFeel, Dark/Light), WebView reserved for dashboard; rejected SwiftUI-hybrid for a solo dev (still needs a C++ RT core + bridge); supporting: CMake, libltc, SQLite, embedded HTTP, ffmpeg/AVFoundation, BWF MetaEdit/ffprobe/sox as test oracles.
+
+## Part A — Adversarial Review
+- **A1 (High) The §11 GPU-meter + §13 out-of-process dashboard partly undercut the "JUCE for everything" simplicity.** GPU meters and XPC children are extra surfaces regardless of stack. → Still net-positive for JUCE (device handling, BWF/RF64, RT primitives), but acknowledge the UI isn't "free."
+- **A2 (High) JUCE CoreAudio layer abstracts away some control** we need (clock source, Dante specifics, fine hot-plug semantics, aux-device correlation §6/§8). → Plan to drop to **raw CoreAudio HAL** for device management where JUCE is insufficient (a documented escape hatch), using JUCE for the rest.
+- **A3 (Med) RF64 support in JUCE** is not guaranteed complete/robust → must validate early or write our own WAV/RF64/BWF writer (likely **write our own** for full control over crash-valid headers, §7). → Treat the file writer as **our code**, not JUCE's, for Tier-0 control.
+- **A4 (Med) libltc integration & licensing** (LGPL) — fine for in-house; verify for future distribution. SQLite (public domain) fine. JUCE license revisit before commercial (already noted §1/§19).
+- **A5 (Med) Apple Silicon specifics:** real-time thread API (`os_workgroup` / Audio Workgroups for CoreAudio render threads), QoS classes, `THREAD_TIME_CONSTRAINT_POLICY` — must be used for writer/aux threads; ensure JUCE plays well or bypass. → Adopt **Audio Workgroups** for threads adjacent to the audio callback.
+- **A6 (Med) Testing/CI on macOS** — GUI/audio CI is hard; need headless engine tests + a hardware soak rig. → Engine logic decoupled from JUCE UI for CI; hardware soak runs on the M4.
+- **A7 (Low) Build reproducibility** — pin JUCE/libltc/ffmpeg versions (R16).
+
+## Part B — Hardened Section 15
+**Confirmed: JUCE 8 + C++ single toolchain**, with explicit escape hatches:
+- **Device management:** JUCE by default; **raw CoreAudio HAL** where needed (clock source, hot-plug nuance, aux-device correlation, Audio Workgroups).
+- **File writer:** **our own** WAV/RF64/BWF/iXML writer (Tier-0 control over crash-valid headers, preallocation, rollover), not JUCE's format writer.
+- **RT threading:** adopt **Apple Audio Workgroups** + proper QoS/time-constraint for capture-adjacent threads.
+- **UI:** JUCE components + custom LookAndFeel (Dark/Light) + **GPU-backed meter view**; WebView/out-of-process for dashboard.
+- **Supporting:** CMake (pinned deps), libltc (LGPL — verify for distribution), SQLite (PD), ffmpeg out-of-process for exports, BWF MetaEdit/ffprobe/sox/iXML tools as CI oracles.
+- **Architecture-for-test:** engine logic decoupled from JUCE UI so it runs headless in CI; UI/audio integration validated on the M4 soak rig.
+**Documented alternative (still not recommended for solo v1):** C++ RT core + SwiftUI shell via Obj-C++ bridge — best native UX, but doubles the surface; reconsider only if a team forms or native chrome becomes top-3.
+
+## Verification (S15)
+Spike-test early: (1) raw-HAL device acquire + hot-plug on Dante/RME; (2) our RF64/BWF writer vs BWF MetaEdit/ffprobe golden; (3) Audio Workgroup adoption measurably tightens callback jitter; (4) headless engine test target builds in CI without the GUI.
+
+---
+---
+
+# Section 16 — Testing Strategy: Adversarial Review & Hardening
+
+## Context
+Original: RT-safety harness (trap alloc/lock/syscall on audio thread); deterministic mock-based engine tests (fake device/clock/disk); LTC synthetic corpus; golden-file format validation (BWF MetaEdit/ffprobe/sox); hardware fault injection; multi-hour/day soak; property/fuzz tests; recovery (kill-9) tests.
+
+## Part A — Adversarial Review
+- **A1 (High) No explicit acceptance gates tied to the §1.2 SLOs.** Tests exist but don't *gate* releases against G1–G5. → Define a gate matrix: each SLO ↔ the specific test that proves it ↔ pass criteria.
+- **A2 (High) RT-guard can't catch everything** (priority inversion, lock-free correctness, ABA). → Add **ThreadSanitizer** runs, lock-free unit tests, and a dedicated **xrun/jitter measurement** harness (callback duration histogram, FIFO HWM under load).
+- **A3 (High) Soak realism.** "Multi-hour" is vague; broadcast needs **multi-day continuous + thermal + power-loss** coverage with automated pass/fail (not eyeballing). → Define soak profiles (24h, 72h, 7-day) with automated invariant checks (zero xruns, RSS flat, all files valid).
+- **A4 (Med) Determinism of the mock device** — must reproduce variable buffer sizes, SR changes, hot-plug, exact xrun injection, and be seedable for repeatability.
+- **A5 (Med) Golden-file maintenance** — format goldens drift; need a regeneration+review process and external-tool validation in CI (containerized ffprobe/sox; BWF MetaEdit may need a Mac runner).
+- **A6 (Med) Fault-injection coverage matrix** — enumerate the fault × state combinations (device pull during arm vs record vs rollover; disk full at start vs mid vs near-4GB) rather than ad hoc.
+- **A7 (Med) Performance regression tracking** — callback jitter / write latency / CPU per channel must be tracked over time (perf CI), not one-off.
+- **A8 (Low) UI testing** — snapshot/VM tests headless; manual checklist for the rest.
+
+## Part B — Hardened Section 16
+**Test pyramid + specialized rigs:**
+- **Unit/property (pure):** NamingEngine, CounterService, TimeAuthority math, metadata mapping, LTC frame arithmetic. Property + fuzz.
+- **Lock-free correctness:** FIFO/command-queue/snapshot under ThreadSanitizer + stress loops.
+- **RT-safety:** debug RT-guard (alloc/lock/syscall trap) + **jitter/xrun harness** (callback p999, FIFO HWM) under synthetic 128ch load.
+- **Mock-integration:** seedable deterministic fake device (variable buffers, SR change, hot-plug, xrun injection) + fake failing/slow/full disk.
+- **Format goldens:** our WAV/RF64/BWF/iXML vs BWF MetaEdit/ffprobe/sox in CI; documented regeneration+review.
+- **LTC corpus:** all rates + drift/dropout/reverse/midnight/DF-NDF/level (§8).
+- **Recovery:** kill-9 / simulated power-loss across the fault×state matrix → repair-on-launch validity.
+- **Soak:** automated 24h / 72h / 7-day profiles on the M4 with invariant checks (zero xruns, RSS flat, thermal bounded, every file valid) + thermal + power-loss events.
+- **Perf CI:** track callback jitter, write latency, CPU/channel over time; regressions block.
+
+**SLO gate matrix:**
+| SLO | Proven by | Pass criterion |
+|---|---|---|
+| G1 no-loss | jitter/xrun harness + soak | 0 dropped samples @ max load |
+| G2 crash-valid | recovery fault×state matrix | 100% files openable |
+| G3 TC-accurate | LTC corpus golden | TimeReference sample-exact |
+| G4 degrade-don't-die | fault injection | capture continues, event logged |
+| G5 long-run-stable | 7-day soak | RSS flat, 0 xruns, thermal OK |
+
+## Verification (S16)
+Each SLO gate is wired into CI/soak with an automated pass/fail; a deliberately-introduced regression (e.g., a malloc in the callback) is caught by the corresponding gate.
+
+---
+---
+
+# Section 17 — Development Roadmap: Adversarial Review & Hardening
+
+## Context
+Original: Phase 0 foundation → 1 capture tracer-bullet → 2 MVP (UI+scale) → 3 TC → 4 workflow → 5 hardening → 6 control/review → 7 scale-out → 8 production readiness; each gated by RT-safety + soak.
+
+## Part A — Adversarial Review
+- **A1 (High) MVP = "Capture + great UI" but hardening (recovery, hot-plug) is Phase 5** — that's *after* MVP. A "great UI" MVP that loses files on a device pull contradicts Priority-1. → Pull **core reliability** (device-loss survival, crash-valid files, basic recovery) *into* the MVP band, even if metadata/markers stay later.
+- **A2 (High) Phases are feature-bands, not risk-ordered.** The riskiest unknowns (raw-HAL device handling, our RF64 writer, Audio Workgroups, 128ch jitter, LTC correlation) should be **spiked in Phase 0/1** to de-risk, not discovered in Phase 2–3. → Add explicit **de-risking spikes** up front.
+- **A3 (Med) No calendar/effort sense for a solo dev** — phases give order but no rough sizing or parallelism limits. → Add coarse effort tiers + "one thing at a time" guidance.
+- **A4 (Med) iXML moved earlier (§9)** and **out-of-process dashboard (§13)** shift phase content. → Reflect.
+- **A5 (Med) No "vertical slice stays shippable" principle** — each phase should leave a usable, reliable build. → State it.
+- **A6 (Low) Dependency between phases** (e.g., TimeAuthority needed before TC, metadata before naming) not drawn. → Note key prerequisites.
+
+## Part B — Hardened Section 17
+**Principle:** risk-ordered, each phase ends shippable + passes RT-safety + a soak appropriate to its scope.
+
+- **Phase 0 — Foundation + de-risking spikes (highest-risk-first):** move repo out of OneDrive; CMake+JUCE scaffold; CI w/ headless engine target; **RT-safety guard**; platform interfaces + seedable mock device. **Spikes:** raw-HAL device acquire/hot-plug (Dante/RME), our RF64/BWF writer vs goldens, Audio Workgroups jitter, 128ch FIFO/jitter under synthetic load. *Gate: spikes prove the risky unknowns.*
+- **Phase 1 — Capture tracer-bullet:** device→delay/gain→FIFO→our writer→mono WAV (fixed count); arm/record/stop; Destination/VolumePolicy (local-only). *Gate: 1h zero-xrun soak, external-tool-valid file.*
+- **Phase 2 — MVP (capture + great UI + core reliability):** GPU meter UI, virtualized track list, gain/delay/bypass, poly WAV, **RF64 auto + BWF + core iXML**, Dark/Light; **device-loss survival, crash-valid files, basic crash-recovery**; 64→128ch. *Gate: multi-hour high-count soak + device-pull/kill-9 recovery pass.* ← **MVP**
+- **Phase 3 — Timecode (P2):** TimeAuthority hardening, LTC engine (all rates), correlation/drift, status+events, sample-accurate TimeReference, midnight.
+- **Phase 4 — Workflow (P3/P5):** SessionModel/Store (versioned), metadata+templates, token naming+builder, daily folders, presets, take/roll/segment counters, rollover (duration/size/TC), pre-record buffer.
+- **Phase 5 — Hardening+:** full recovery journal, health monitoring + clip detection, event log, mirror writer.
+- **Phase 6 — Control & review:** markers (+CSV/PDF), keyboard + OSC/HTTP API + Stream Deck (via API), Record-Safe/Lock across all surfaces, isolated playback/review, out-of-process exports.
+- **Phase 7 — Scale-out:** out-of-process remote dashboard, multi-recorder schema.
+- **Phase 8 — Production readiness (§19).**
+
+**Prereqs:** TimeAuthority → TC/rollover/naming; SessionModel → metadata → naming; VolumePolicy → recording.
+**Solo guidance:** one phase at a time; spikes may interleave; don't start Phase 4+ features until Phase 2 reliability gates hold.
+
+## Verification (S17)
+Each phase has an explicit gate; Phase 0 spikes retire the top technical risks (R1–R6, A2) before feature build; every phase produces a shippable, soak-passing build.
+
+---
+---
+
+# Section 18 — MVP Recommendation: Adversarial Review & Hardening
+
+## Context
+Original MVP = Phases 1–2: any CoreAudio device + channel map + missing-device detection; arm/record/stop; mono+poly WAV w/ RF64 auto + BWF; per-track delay/gain/bypass; modern virtualized metering UI; disk space + remaining-time; Dark/Light; local-volume guard; 64→128ch. Deferred: LTC, metadata/naming, recovery, health/clip, markers, control, dashboard, mirror, playback, exports.
+
+## Part A — Adversarial Review
+- **A1 (Critical) Deferring recovery + device-loss survival from MVP violates Priority-1.** An MVP that drops files when Dante blips or on a crash isn't "reliable capture." → **Move device-loss survival + crash-valid files + basic recovery into MVP** (per §17 A1).
+- **A2 (High) No TC at all in MVP** — but broadcast files without *any* timecode (even ToD) have limited use; full LTC can wait, but **ToD timestamp + BWF TimeReference from system clock** is cheap and should be in MVP. → Add ToD-based TimeReference (no LTC) to MVP.
+- **A3 (Med) "Great UI" is subjective** — define MVP UI acceptance (128ch meters @60Hz, Dark/Light, no UI-thread stalls).
+- **A4 (Med) MVP success metric must be the soak gate, not feature completeness** — restate DoD around G1/G2/G5 + the device-pull/kill-9 tests.
+- **A5 (Low) Risk of MVP scope creep** from "great UI" — keep workflow (metadata/naming/markers) firmly out.
+
+## Part B — Hardened Section 18
+**MVP = Phase 1–2, reliability-first:**
+- Any CoreAudio device, channel map, missing-device detection, **hot-plug survival** (keep buffered audio, mark gap, re-acquire).
+- Arm/record/stop; mono + poly WAV; **RF64 auto + BWF + core iXML**; **ToD-based TimeReference** (system clock, no LTC yet).
+- Per-track delay/gain/bypass; GPU-backed 128ch metering @60Hz; Dark/Light; disk space + remaining-time; **local-volume-only guard**.
+- **Crash-valid files + basic crash-recovery** (repair-on-launch).
+- 64→128ch validated.
+**Deferred (next phases):** full LTC, metadata/naming/templates/presets, take/roll, full recovery journal, health/clip system, markers, control surfaces, dashboard, mirror, playback, exports.
+**Definition of Done:** passes **G1 (0 xruns @128ch multi-hour), G2 (kill-9 → valid files), G5 (no RSS/thermal drift)** + a **device-pull-during-record** test (capture survives), with files validated by external tools.
+
+## Verification (S18)
+Run the MVP DoD suite on the M4 with Dante: multi-hour 128ch soak (0 xruns), mid-record device pull (survives), kill-9 (recovers), output validated in BWF MetaEdit/ffprobe; UI sustains 60Hz with no thread stalls.
+
+---
+---
+
+# Section 19 — Production Readiness Roadmap: Adversarial Review & Hardening
+
+## Context
+Original: reliability certification (72h+/multi-day soak); device matrix sign-off w/ fault injection; crash/power-loss recovery suite; packaging (Developer ID, hardened runtime, notarization, entitlements, updates, JUCE license/App-Store revisit); operational docs + crash reporting; beta with real productions.
+
+## Part A — Adversarial Review
+- **A1 (High) "In-house first" still needs production-readiness — but a different bar.** The original reads like a commercial checklist; for in-house deployment the priority is **operational runbooks + appliance setup + recovery drills**, with commercial packaging deferred. → Split into **In-house GA** vs **Commercial GA** gates.
+- **A2 (High) No defined certification *evidence*** — "72h soak" needs recorded artifacts (logs, xrun counts, file-validation reports) that constitute a sign-off record, especially for broadcast trust. → Define a certification report artifact per release.
+- **A3 (Med) Appliance deployment (§1.8) has no readiness items** — auto-launch, auto-recover-after-restart, sleep/update disabling, kiosk config, UPS guidance. → Add appliance hardening checklist.
+- **A4 (Med) Field-failure feedback loop** — opt-in crash/telemetry + event-log export workflow so real-world failures improve the product. → Define.
+- **A5 (Med) Data-safety / no-regression on originals** for exports (§ exports) and any future edit — guarantee originals never mutated. → Add as a release invariant.
+- **A6 (Low) Localization/accessibility sign-off** for commercial; security review for network features before distribution.
+
+## Part B — Hardened Section 19
+**Two gates:**
+- **In-house GA (near-term):** pass all SLO gates (§16); device-matrix sign-off (DVS, Digiface, RME, Focusrite, USB/TB) incl. fault injection; **certification report artifact** (soak logs, xrun=0 evidence, recovery results, file-validation reports) per build; **appliance hardening checklist** (auto-launch, auto-recover-after-restart, sleep/AppNap/auto-update disabled, UPS, kiosk); operational **runbooks + recovery drills**; opt-in crash/telemetry + event-log export.
+- **Commercial GA (later):** Developer ID signing, hardened runtime, **notarization**, entitlements (mic/audio), update mechanism; **JUCE commercial license** + App-Store/sandbox decision; **network-feature security review** (dashboard/OSC/HTTP); localization + accessibility sign-off; support/SLA story.
+**Release invariants:** originals never mutated; every release ships a certification report; no Tier-0 risk at residual ≥ Med (§4).
+
+## Verification (S19)
+Produce a signed-off certification report for an in-house GA candidate (soak + device matrix + recovery evidence); validate appliance survives a forced restart and resumes/recovers unattended.
+
+---
+---
+
+# Section 20 — Feature Prioritization: Adversarial Review & Hardening
+
+## Context
+Original mapped features to the six engineering priorities (reliability→TC→metadata→scalability→workflow→UI) across phases, with explicit deferrals (mirror, dashboard, exports, OSC/MIDI breadth, iXML writing, App Store).
+
+## Part A — Adversarial Review
+- **A1 (High) Internal inconsistencies after the deep review:** iXML moved to MVP/early (§9/§18), core reliability moved into MVP (§17/§18), confidence monitoring surfaced as in-scope-post-MVP (§1). The prioritization must be reconciled. → Update.
+- **A2 (Med) Priorities are categories, not a backlog** — needs a should/could split (MoSCoW) within phases so trade-offs under time pressure are pre-decided. → Add Must/Should/Could/Won't per phase.
+- **A3 (Med) No explicit "Won't (v1)"** beyond scattered deferrals — collect them so scope is unambiguous. → Consolidated Won't list.
+- **A4 (Low) Confidence monitoring (§1 open decision)** needs a placed priority pending user confirmation.
+
+## Part B — Hardened Section 20 (reconciled, MoSCoW)
+**P1 Reliability (Must, Phases 0–2,5):** RT firewall+harness, FIFO/writer-pool, our crash-valid writer, preallocation, **device-loss survival + crash-recovery in MVP**, soak gates, VolumePolicy.
+**P2 Timecode (Phase 3; Must: ToD TimeReference in MVP):** continuous LTC, correlation/drift, sample-accurate TimeReference, midnight, events.
+**P3 Metadata (Phase 2 core / Phase 4 full):** **BWF + core iXML early (Must)**, full metadata model/templates/sidecar (Should), custom typed fields.
+**P4 Scalability (Phase 2, Must):** 128ch validated, virtualized GPU UI, writer-pool tuning.
+**P5 Workflow (Phases 4–6, Should):** naming/folders/presets/counters/rollover, pre-record buffer, markers, control surfaces (OSC/HTTP/Stream Deck), health monitoring, mirror.
+**P6 UI (Phase 2 Must shell; ongoing Should):** modern Dark/Light, meters; dashboard (Could, Phase 7).
+**Confidence monitoring (pending §1 decision):** if approved → **Should, post-MVP (Phase 5/6)**.
+**Won't (v1):** A/B chase-sync; full DAW/editing; plugin/effects beyond delay+gain; in-process dashboard; MIDI control (eval only); App-Store distribution; aggregate-device as a supported high-count path.
+
+## Verification (S20)
+Cross-check every feature's phase/MoSCoW against §17 phases and §1.6 tiers; confirm no Must depends on a Could; confirm the Won't list matches the deferrals scattered across §§1–19.
+
+---
+---
+
+# Section 21 — First Implementation Task: Adversarial Review & Hardening
+
+## Context
+Original first task: Phase 0 foundation + Phase 1 capture tracer-bullet — (1) relocate out of OneDrive + scaffold CMake/JUCE/CI; (2) **RT-safety guard first**; (3) platform interfaces + mock device; (4) thinnest real path device→FIFO→writer→mono WAV on local volume w/ arm/record/stop; (5) prove via 1h zero-xrun soak + external-tool-valid file.
+
+## Part A — Adversarial Review
+- **A1 (High) Missing the de-risking spikes (§17 A2)** that should precede or accompany the tracer-bullet: raw-HAL device handling, our RF64/BWF writer, Audio Workgroups, 128ch jitter. The first task should explicitly *retire top risks*, not just produce a happy-path recorder. → Fold the highest-risk spikes into the first task.
+- **A2 (Med) "Thinnest real path" lacks the firewall proof** — the first task must demonstrate the RT/non-RT firewall + lock-free FIFO + Telemetry (FIFO HWM/jitter), not just write a file. → Make instrumentation part of the deliverable.
+- **A3 (Med) Definition of done needs measurable criteria** beyond "1h soak" — specify channel count, xrun=0, FIFO HWM bounded, file validates, RT-guard clean under TSan. 
+- **A4 (Low) Sequence risk:** scaffolding before the firewall is fine, but the *first code that touches audio* must already be inside the firewall + guard.
+
+## Part B — Hardened Section 21 (the actual first task)
+**Goal: a reliability-proving vertical slice that retires the top technical risks.**
+1. **Foundation:** move repo out of OneDrive; CMake + JUCE scaffold; CI with a **headless engine test target**; pin deps.
+2. **RT-safety guard first** (trap alloc/lock/syscall on the audio thread) — before any audio code.
+3. **Platform interfaces + seedable mock device** (variable buffers, SR change, hot-plug, xrun injection).
+4. **De-risking spikes (concurrent):** (a) **raw-HAL** device acquire + hot-plug on Dante/RME; (b) **our WAV/RF64/BWF writer** validated vs BWF MetaEdit/ffprobe goldens; (c) **Audio Workgroups** on capture-adjacent threads; (d) **128ch jitter/FIFO** under synthetic load.
+5. **Tracer-bullet path (inside the firewall):** real device → lock-free FIFO → writer pool → mono WAV on a **local** volume; arm/record/stop; **Telemetry** (FIFO HWM, callback p999).
+6. **Prove it (DoD):** **128ch, 1h+ soak, xrun=0, FIFO HWM bounded, RT-guard + ThreadSanitizer clean, output file validates externally, hot-plug during record survives.**
+
+## Verification (S21)
+The first task is "done" only when the DoD above passes on the M4 with Dante — i.e., the riskiest unknowns (RT-safety, raw-HAL device handling, our format writer, jitter at 128ch, hot-plug survival) are demonstrably retired before any feature/UI work begins.
+
+---
+---
+
+## Planner Status
+All 21 sections completed in deep format (adversarial review + hardened version + verification each). Sections 1–3 also include a separate hardened-rewrite; Sections 4–21 fold the hardening inline. Cross-section consistency reconciled in §17/§18/§20 (iXML-early, core-reliability-in-MVP, confidence-monitoring pending user decision). Outstanding user decision: confidence/headphone monitoring scope (§1 A10).
