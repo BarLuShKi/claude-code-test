@@ -970,4 +970,433 @@ The first task is "done" only when the DoD above passes on the M4 with Dante —
 ---
 
 ## Planner Status
-All 21 sections completed in deep format (adversarial review + hardened version + verification each). Sections 1–3 also include a separate hardened-rewrite; Sections 4–21 fold the hardening inline. Cross-section consistency reconciled in §17/§18/§20 (iXML-early, core-reliability-in-MVP, confidence-monitoring pending user decision). Outstanding user decision: confidence/headphone monitoring scope (§1 A10).
+All 21 sections completed in deep format (adversarial review + hardened version + verification each). Sections 1–3 also include a separate hardened-rewrite; Sections 4–21 fold the hardening inline. Cross-section consistency reconciled in §17/§18/§20 (iXML-early, core-reliability-in-MVP). **RESOLVED DECISION (confidence/headphone monitoring, §1 A10):** **out of MVP; not in M1 or M2; assigned to Phase 5 / M5.** MVP is **metering-only**. Playback/spot-check is acceptable later (M5) but **no live monitor mixer, no PFL/solo bus, no headphone routing in MVP.**
+
+---
+---
+---
+
+# PART II — EXECUTION PLAN (Architecture → Implementation)
+
+> Architecture approved in principle. This part plans the build. **No code.** It maps the approved architecture (Part I, §§1–21) onto features, milestones, modules, repo, tests, a first coding milestone, and a Claude Code session sequence.
+>
+> **Reconciliation of vocabulary:** the user's "MVP = capable of [device/mono/poly/32tracks/meters/disk-time/LTC/basic-metadata/naming/Record-Safe/Lock/markers/session-save-load]" is **broader** than the reliability-only MVP in §18. We honor the user's list: **MVP = Milestone 1 + Milestone 2.** Point-1's "Phase 2 / Phase 3" map to **Milestone 3 (Phase 2)** and **Milestones 4–5 (Phase 3)**.
+
+## 1. Feature Triage
+
+Legend — **MVP** = M1+M2 · **P2** = M3 · **P3** = M4–M5 · **Cut** = removed from roadmap.
+
+| Feature | Bucket | Notes / scoped depth |
+|---|---|---|
+| CoreAudio device select + channel map + missing-device detection | **MVP** | raw-HAL where JUCE insufficient (§15) |
+| Device hot-plug **survival** (keep buffering, mark gap, re-acquire) | **MVP** | Priority-1; can't be deferred |
+| Mono WAV / Polyphonic WAV | **MVP** | our writer (§7/§15) |
+| RF64 auto + BWF `bext` | **MVP** | reliability + post hand-off |
+| core iXML | **MVP** | promoted early (§9) |
+| ≥32 tracks (architected to 128) | **MVP** | MVP gate = 32; scale validated later |
+| Input meters (GPU-backed) | **MVP** | §11 |
+| Disk remaining + remaining-time estimate | **MVP** | § DiskMgmt |
+| Local-volume-only guard (refuse cloud/network) | **MVP** | reliability |
+| Crash-valid files + basic crash-recovery | **MVP** | Priority-1 (pulled in from §18) |
+| LTC decode + display + sample-accurate TimeReference | **MVP (M2)** | drift/flywheel/quality → **P2** |
+| Basic metadata (fields + cascade + bext/iXML map) | **MVP (M2)** | templates UI → **P2** |
+| Naming templates (token engine + preview) | **MVP (M2)** | visual drag-drop builder polish → **P2** |
+| Markers + notes (TC-stamped) + CSV export | **MVP (M2)** | PDF export → **P2** |
+| Record Safe mode + Lock mode (CommandService-enforced) | **MVP** | §2/§11 |
+| Session save/load (SessionModel + versioned store) | **MVP** | §5 |
+| ToD-based TimeReference (no-LTC fallback) | **MVP** | §8 A7 |
+| Pre-record buffer | **P2** | valued, not MVP-critical |
+| Auto rollover (duration/size/TC) | **P2** | M3 |
+| Session/track templates & presets | **P2** | M3 |
+| Take/Roll/Segment auto-numbering | **P2** | M3 |
+| Daily folder system (token-based) | **P2** | M3 |
+| Full health monitoring + clip classification | **P2/P3** | basic clip flag in MVP; full system M3/M4 |
+| Mirrored recording | **P3 (M4)** | best-effort, isolated |
+| LTC drift/flywheel/reverse/quality | **P2 (M3)** | core decode is MVP |
+| Visual naming builder (drag-drop) | **P2 (M3)** | functional templates in MVP |
+| Stream Deck / OSC / HTTP control | **P3 (M4)** | keyboard shortcuts in MVP |
+| Remote dashboard (out-of-process) | **P3 (M5)** | §13 |
+| Playback / spot-check (isolated Review) | **P3 (M5)** | §14 |
+| Exports MP3/AAC/FLAC (out-of-process) | **P3 (M5)** | never touch originals |
+| Confidence/headphone monitoring | **P3 (M5), pending decision** | §1 A10 open |
+| Multi-recorder dashboard aggregation | **P3 (M5)** | schema reserved |
+| MIDI control | **Cut** | low value vs OSC/HTTP; re-eval only on demand |
+| Aggregate-device as a *supported* high-count path | **Cut** | drift risk (R4); single clocked device only |
+| A/B chase-sync between recorder instances | **Cut (v-roadmap)** | huge; out of scope; "run 2nd instance" stays operational-only |
+| In-app waveform editing / fades / DAW features | **Cut** | non-goal (§1) |
+
+## 2. Realistic MVP Definition
+
+**MVP = a rock-solid 32-track recorder with thin-but-complete TC/metadata/workflow skin.** Reliability and recording quality first; breadth deliberately shallow.
+
+**MVP does:**
+- Select any CoreAudio input device; map channels; detect missing device; **survive hot-plug** mid-record (buffer, mark gap, re-acquire).
+- Arm/record/stop **≥32 tracks** as **mono and polyphonic WAV**, **RF64-auto + BWF + core iXML**, written by **our** crash-valid writer to **local volumes only**.
+- **LTC decode** (the 7 rates) → live TC display + **sample-accurate BWF TimeReference**; **ToD fallback** when no LTC.
+- **Basic metadata** (project/scene/take/roll/track/notes/custom) with cascade + bext/iXML mapping.
+- **Naming templates** (token engine, live preview, sanitize, dedupe) — functional, not yet drag-drop.
+- **Markers + notes** (TC-stamped) with CSV export; keyboard-triggerable.
+- **Record Safe** + **Lock** modes enforced in CommandService.
+- **Session save/load** (versioned) + **basic crash-recovery** (repair-on-launch).
+- **GPU input meters**, **disk remaining + remaining-time**, Dark/Light.
+
+**MVP deliberately does NOT:** pre-record buffer, rollover, templates/presets, daily folders, take/roll auto-numbering, mirror, dashboard, playback, exports, OSC/HTTP/Stream Deck, drag-drop naming UI, full health system, confidence monitoring.
+
+**MVP Definition of Done (gates, §16):** G1 (0 xruns, 32ch, multi-hour), G2 (kill-9 → valid files), G3 (LTC TimeReference sample-exact), G4 (device-pull during record → capture survives), G5 (no RSS/thermal drift); all output validated by BWF MetaEdit/ffprobe/iXML tools.
+
+## 3. Milestone Roadmap
+
+### Milestone 1 — Complete, independently testable recorder core
+- **Objective:** glitch-free multitrack capture→disk with safe operation, **no TC/metadata yet**, fully testable headless.
+- **Included:** device select/map/missing-detect/hot-plug survival; RT firewall + lock-free FIFO + writer pool; **our** mono+poly WAV/RF64/BWF writer; ≥32ch; GPU meters; disk remaining+estimate; local-volume guard; Record-Safe + Lock; SessionModel + save/load (versioned); crash-valid files + basic recovery; Telemetry (FIFO HWM, callback p999).
+- **Excluded:** LTC, metadata, naming templates, markers, rollover, presets, dashboard, playback, exports.
+- **Risks:** raw-HAL device handling; our writer correctness (RF64/crash-valid); 32→128ch jitter; recovery correctness. *(R1–R7)*
+- **Validation:** 1h→multi-hour 32ch soak (0 xruns); kill-9 recovery; device-pull survival; golden-file format check; RT-guard + TSan clean.
+- **Complexity:** **XL** (the hardest, highest-risk milestone — the whole reliability spine).
+
+### Milestone 2 — Timecode + Metadata
+- **Objective:** make recordings broadcast-usable (correct TC + metadata + names + markers).
+- **Included:** TimeAuthority hardening; **LTC decode** (7 rates) + display + sample-accurate TimeReference + ToD fallback; basic metadata model + bext/iXML embedding; token **naming engine** + preview; **markers/notes** + CSV; keyboard shortcuts for record/stop/marker.
+- **Excluded:** LTC drift/flywheel/quality; visual naming builder; templates/presets; rollover; dashboard.
+- **Risks:** audio↔TC correlation accuracy; iXML/bext correctness; naming collision safety. *(R5, §8/§9/§10)*
+- **Validation:** LTC corpus (all rates, midnight, dropout) → TimeReference exact; BWF MetaEdit/iXML validation; naming property tests; marker CSV round-trip.
+- **Complexity:** **L**.
+
+> **MVP ships at end of M2.**
+
+### Milestone 3 — Workflow features (Phase 2)
+- **Objective:** fast multi-show setup + long-form continuity.
+- **Included:** pre-record buffer; auto rollover (duration/size/TC); session/track **templates + presets**; **take/roll/segment** auto-numbering; **daily folders**; visual drag-drop naming builder; LTC drift/flywheel/quality; basic health + clip classification; marker PDF export.
+- **Excluded:** mirror, dashboard, playback, exports, control APIs.
+- **Risks:** gapless rollover sample-accuracy; counter/naming interplay; continuous-mode data model. *(§5/§7/§10)*
+- **Validation:** rollover golden-files (no drop/dup at boundary); preset apply/round-trip; multi-day continuous-mode soak.
+- **Complexity:** **L**.
+
+### Milestone 4 — Production-ready features (Phase 3a)
+- **Objective:** field/broadcast hardening + operability.
+- **Included:** full health monitoring (predictive FIFO/latency warnings, hysteresis, ack/snooze, session health summary); **mirrored recording**; full **recovery journal**; event log; **control surfaces** (OSC/HTTP API + Stream Deck via API); appliance hardening (auto-launch/recover, sleep/update inhibit).
+- **Excluded:** dashboard, playback, exports (M5).
+- **Risks:** mirror isolation; network trust boundary; multi-day reliability evidence. *(R2/R12/§13)*
+- **Validation:** fault-injection matrix; 72h–7day soak with certification report; mirror-failure isolation test; control-API security/fuzz.
+- **Complexity:** **L–XL**.
+
+### Milestone 5 — Advanced features (Phase 3b)
+- **Objective:** convenience + remote awareness without risking capture.
+- **Included:** out-of-process **remote dashboard** (read-only) + multi-recorder schema; isolated **playback/Review**; **exports** MP3/AAC/FLAC (out-of-process); confidence monitoring (if approved).
+- **Excluded:** A/B chase, MIDI, editing (Cut).
+- **Risks:** process isolation correctness; device contention (playback); export never mutates originals. *(§13/§14)*
+- **Validation:** dashboard-crash → capture unaffected; playback device-handoff glitch-free; export bit-identical originals preserved.
+- **Complexity:** **M–L**.
+
+## 4. Module Dependency Map
+
+(From hardened §3. **MVP?** = needed for M1+M2. **Postpone?** = can ship after MVP.)
+
+| Module | Purpose | Depends on | MVP? | Postpone? |
+|---|---|---|---|---|
+| AppCoordinator | composition root; DI; start/stop ordering; boot→recovery→acquire→restore | (all, via interfaces) | **Yes (M1)** | No |
+| PlatformAbstraction (interfaces + mocks) | AudioDevice/FileSystem/DiskSpace/SystemClock/Storage/Net seams | — | **Yes (M1)** | No |
+| AudioDeviceManager | device discovery/select/map/missing/hot-plug/clock; raw-HAL where needed | Platform | **Yes (M1)** | No |
+| CaptureEngine | RT callback: delay→gain→bypass→meter/clip tap→FIFO; consume command FIFO | DeviceMgr, FIFO, TimeAuthority, Telemetry | **Yes (M1)** | No |
+| LockFreeFIFO / CommandFIFO / Snapshot / EventBus | RT↔non-RT plumbing | — | **Yes (M1)** | No |
+| Transport/TimeAuthority | sample master + sample↔TC↔wall map | — | **Yes (M1 basic / M2 full)** | No |
+| DiskWriterPool | drain→format→WAV/RF64/BWF/iXML→crash-valid headers→preallocate | FIFO, our FormatWriter, VolumePolicy | **Yes (M1)** | No |
+| FormatWriter (our WAV/RF64/BWF/iXML) | byte-level file format + crash-valid + metadata embed | TimeAuthority, Metadata | **Yes (M1 WAV/RF64/BWF; M2 iXML/meta)** | No |
+| Destination/VolumePolicy | local-only enforce; cloud/network refuse; disk planning/remaining-time | Platform/DiskSpace | **Yes (M1)** | No |
+| RecordingEngine | arm/start/stop; segment lifecycle; decides rollover; sample↔TC stamping | CaptureEngine, WriterPool, TimeAuthority | **Yes (M1)** | No |
+| Telemetry | lock-free counters/histograms (FIFO HWM, callback p999, write latency) | — | **Yes (M1)** | No |
+| RecoveryJournal | durable WAL; segment status; repair-on-launch | Storage(SQLite) | **Yes (M1 basic / M4 full)** | Partial |
+| SessionModel | in-memory single source of truth + change-notify | — | **Yes (M1)** | No |
+| SessionStore | persistence (JSON, versioned + migration) | SessionModel | **Yes (M1)** | No |
+| MeteringService | aggregate RT meter atoms → UI rate | CaptureEngine taps | **Yes (M1)** | No |
+| CommandService | the choke point; Record-Safe/Lock gating | SessionModel, RecordingEngine | **Yes (M1)** | No |
+| GUI/ViewModels | bind snapshots/events; send commands; GPU meters; Dark/Light | CommandService, Snapshots | **Yes (M1)** | No |
+| LTCEngine | decode (libltc), TC tracking, events | aux/selected channel tap, TimeAuthority | **Yes (M2 core)** | Partial (drift→M3) |
+| MetadataService | field model, templates, live-edit, bext/iXML map | SessionModel | **Yes (M2 basic)** | Partial |
+| NamingEngine | token resolution, sanitize, dedupe, preview | Metadata, Counters, TimeAuthority | **Yes (M2)** | Partial (builder→M3) |
+| CounterService | roll/take/segment + rules | SessionModel | **M2 minimal / M3 full** | Partial |
+| MarkerService | TC-stamped markers/notes; CSV/PDF | TimeAuthority, RecordingEngine | **Yes (M2; PDF→M3)** | Partial |
+| LocalControl | keyboard (+ local Stream Deck later) → CommandService | CommandService | **M2 (keyboard)** | Partial |
+| PreRecordBuffer | rolling pre-roll ring | CaptureEngine | No | **Yes (M3)** |
+| PresetService/TemplateService | session/track presets+templates | SessionStore | No | **Yes (M3)** |
+| HealthMonitor | sample/level/hysteresis/clip-classify | Telemetry, EventBus | basic clip only | **Yes (M3/M4)** |
+| EventLog | append-only operational log | EventBus, Storage | No | **Yes (M3/M4)** |
+| MirrorWriter | best-effort secondary write | WriterPool (own FIFO) | No | **Yes (M4)** |
+| NetworkControlGateway | OSC/HTTP ingress (auth/rate-limit) → CommandService | CommandService | No | **Yes (M4)** |
+| RemoteDashboard | out-of-process read-only status | shared snapshot IPC | No | **Yes (M5)** |
+| PlaybackEngine | isolated spot-check; own output device | SessionModel, ledger | No | **Yes (M5)** |
+| ExportService | out-of-process transcode from originals | ffmpeg child | No | **Yes (M5)** |
+
+**Critical-path (must exist before anything records):** PlatformAbstraction → AudioDeviceManager → CaptureEngine + FIFO + TimeAuthority(basic) → FormatWriter + WriterPool + VolumePolicy → RecordingEngine → CommandService → SessionModel/Store → GUI. **No MVP module depends on a postponed module.**
+
+## 5. Recommended Repository Structure
+
+**Key principle:** the **engine library has zero JUCE-UI dependency** so it builds + tests headless in CI; the app target adds JUCE UI on top.
+
+```
+recorder/
+├─ CMakeLists.txt              # top-level; options: BUILD_APP, BUILD_TESTS, BUILD_BENCH
+├─ cmake/                      # toolchain, deps (FetchContent/pinned), Audio Workgroups helpers
+├─ third_party/               # pinned: JUCE, libltc, sqlite (vendored or FetchContent)
+├─ engine/                    # ← pure C++ core, NO JUCE-UI. The reliability spine.
+│  ├─ rt/                     # RT firewall, lock-free FIFO/command/snapshot, RT-guard
+│  ├─ audio/                  # CaptureEngine, device abstraction, meter/clip taps
+│  ├─ time/                   # TimeAuthority, LTC engine
+│  ├─ io/                     # FormatWriter (WAV/RF64/BWF/iXML), WriterPool, VolumePolicy
+│  ├─ record/                 # RecordingEngine, segment lifecycle, rollover
+│  ├─ session/               # SessionModel, metadata, naming, counters, markers
+│  ├─ recovery/              # journal, repair-on-launch
+│  ├─ telemetry/             # counters/histograms
+│  └─ platform/              # interfaces (AudioDevice/FileSystem/DiskSpace/Clock/Storage/Net)
+│     └─ macos/              # raw-HAL CoreAudio, APFS, Audio Workgroups impls
+├─ app/                       # ← JUCE app: GUI/ViewModels, CommandService wiring, LookAndFeel
+│  ├─ ui/                     # views, GPU meter view, Dark/Light themes
+│  └─ control/               # keyboard; (later) OSC/HTTP gateway, Stream Deck
+├─ services/                  # out-of-process helpers (later): dashboard/, exporter/
+├─ tests/
+│  ├─ unit/                   # pure logic (naming, counters, time math, metadata)
+│  ├─ lockfree/               # TSan stress for FIFO/command/snapshot
+│  ├─ integration/            # mock-device → FIFO → writer → file
+│  ├─ format_golden/          # WAV/RF64/BWF/iXML vs external tools
+│  ├─ ltc_corpus/             # synthetic LTC fixtures + decode assertions
+│  ├─ fault_injection/        # device pull, SR change, disk full, kill-9
+│  ├─ soak/                   # 1h/24h/72h/7d harness + invariant checks
+│  └─ fixtures/               # seedable mock device, fake disk, golden files
+├─ tools/                     # md2pdf, golden regenerators, soak report generator
+├─ docs/
+│  ├─ architecture/           # Part I (§§1–21) split per section + reviews/
+│  ├─ execution/              # this Part II
+│  └─ runbooks/               # appliance setup, recovery drills (M4)
+└─ .github/workflows/         # CI: headless engine build+tests; perf CI; (mac runner for goldens)
+```
+
+**Build strategy:** CMake + pinned deps via FetchContent; three targets — `recorder_engine` (lib, headless, CI-tested), `recorder_app` (JUCE), `recorder_tests`. Debug builds enable the **RT-guard** + sanitizers (ASan/TSan/UBSan); Release tunes for Apple Silicon + Audio Workgroups. Perf/soak as separate CTest labels.
+
+**Session/project file strategy (from §5):** two stores — **mutable config** = human-readable **JSON, versioned with forward-migration** (`.recsession` bundle: session.json + templates + presets); **immutable recording ledger** = **SQLite WAL** (segments/markers/events) for crash-safe durability + recovery. A session is a **bundle/folder** (config JSON + ledger.db + daily folders), not a single opaque file — survivable and inspectable.
+
+## 6. Testing Plan
+
+| Layer | What | How / tools |
+|---|---|---|
+| **Unit** | NamingEngine (sanitize/dedupe/preview), CounterService, TimeAuthority rational math, Metadata mapping, VolumePolicy | property + example tests, headless, fast |
+| **Lock-free correctness** | FIFO/command/snapshot under contention | ThreadSanitizer + stress loops; ABA/ordering assertions |
+| **RT-safety** | no alloc/lock/syscall in callback; jitter | RT-guard trap (debug) + callback p999 / FIFO HWM harness @ 32–128ch |
+| **Integration** | mock-device → delay/gain → FIFO → writer → file | seedable fake device + fake disk; assert sample-exact output |
+| **Long-duration recording** | 1h / 24h / 72h / 7-day continuous | soak harness; invariants: 0 xruns, RSS flat, thermal bounded, every file valid; automated pass/fail + report artifact |
+| **LTC dropout** | dropout→flywheel→recovery, midnight, reverse, varispeed, DF/NDF, level | synthetic LTC corpus; assert TimeReference exactness + correct state events |
+| **Device disconnect/reconnect** | pull/re-add during arm, record, rollover | mock + **hardware** (Dante/RME) fault injection; capture survives, gap marked, re-acquires |
+| **Disk failure simulation** | disk full (start/mid/near-4GB), slow disk, I/O error, removed volume | fake failing FileSystem + real external SSD; mirror continues, primary finalizes valid, CRITICAL raised |
+| **RF64 validation** | >4GB transition, ds64, header correctness, WAV↔RF64 decision | golden-file compare vs **BWF MetaEdit + ffprobe + sox**; large-file generation test |
+| **Recovery** | kill-9 / power-loss across fault×state matrix | repair-on-launch → 100% files openable (G2) |
+| **Format goldens** | WAV/RF64/BWF/iXML correctness | external tools in CI; documented regen+review |
+| **Perf regression** | callback jitter, write latency, CPU/channel over time | perf CI; regressions block merge |
+| **UI** | ViewModel/snapshot binding; 60Hz meter render no-alloc | headless VM tests + manual checklist |
+
+**SLO gate matrix** (§16) wires G1–G5 to the specific suites above; a release requires all gates green + a soak certification report.
+
+## 7. First Coding Milestone (M0 — the foundation slice)
+
+**Smallest useful thing that compiles, runs, is independently testable, and locks in the architecture — before real CoreAudio or any UI.**
+
+- **Scope:** top-level CMake + three targets; `engine/rt` (RT-guard + lock-free FIFO + triple-buffer snapshot + command FIFO); `engine/platform` interfaces + **seedable mock audio device** + **fake disk**; minimal `FormatWriter` (mono+poly **WAV**, then RF64 header) + single-thread writer; a headless `RecordingEngine` path: **mock device → FIFO → writer → WAV file**; Telemetry counters; a CTest suite (unit + integration + lockfree-TSan + one format-golden).
+- **Explicitly NOT in M0:** real CoreAudio, GUI, LTC, metadata, BWF/iXML, recovery, multi-thread writer pool tuning.
+- **Compiles:** `cmake --build` produces `recorder_engine` + `recorder_tests`.
+- **Runs:** a tiny headless harness records 30s from the mock device to a valid WAV.
+- **Testable independently:** `ctest` passes unit + integration + TSan + golden, with the **RT-guard clean**.
+- **Establishes the architecture:** RT/non-RT firewall, lock-free plumbing, platform mock seams, our-writer ownership, headless-engine-for-CI — every later module plugs into these.
+- **Exit criterion:** mock-device→WAV integration test green under ASan/TSan, RT-guard reports zero violations, golden WAV validates in ffprobe.
+
+> M0 is a strict subset of Milestone 1. After M0, the next slice swaps the mock device for **real CoreAudio (raw-HAL)** and adds the **writer pool + crash-valid headers + VolumePolicy** — completing M1 incrementally.
+
+## 8. Recommended Claude Code Session Sequence
+
+**Principles to minimize tokens & avoid architectural drift:**
+- **One session = one module/concern**, scoped to a single milestone slice; don't reopen settled design.
+- **Start each session** by reading only the relevant planner section(s) + the interface contracts it touches (not the whole planner) — point Claude at `docs/architecture/<section>.md` and the specific headers.
+- **End each session** with: tests green, RT-guard/sanitizers clean (where applicable), a focused **commit**, and a 3-line "what changed / what's next" note appended to `docs/execution/progress.md`.
+- **Contracts before implementations:** lock interfaces/headers first; implement against them; this prevents drift across sessions.
+- **Keep context small:** prefer many short sessions over one long one; let earlier commits + the progress note carry state instead of re-reading everything.
+
+| # | Session | Goal (deliverable) | Reads | Gate |
+|---|---|---|---|---|
+| S0 | Repo + CI scaffold | move out of OneDrive; CMake 3 targets; CI headless; pinned deps; RT-guard skeleton | §15, §17, repo-struct | builds + CI green |
+| S1 | RT plumbing | lock-free FIFO + command FIFO + triple-buffer snapshot + RT-guard | §2, §6 | TSan stress green |
+| S2 | Platform seams + mocks | interfaces + seedable mock device + fake disk | §2, §3, §6 | mock unit tests |
+| S3 | FormatWriter (WAV/RF64) | our byte-level WAV→RF64 writer + golden test | §7, §9, §15 | ffprobe golden |
+| S4 | M0 integration slice | mock→FIFO→writer→WAV headless + Telemetry | §6, §7, §21 | **M0 exit criteria** |
+| S5 | Real device (raw-HAL) | CoreAudio acquire/map/missing/**hot-plug** | §6, §15 | hardware pull test |
+| S6 | WriterPool + crash-valid + VolumePolicy | pool partition, header patching, local-only, recovery basics | §5, §7 | kill-9 recovery |
+| S7 | RecordingEngine + CommandService + Lock/Record-Safe | arm/start/stop, gating choke point | §2, §3, §11 | gating tests |
+| S8 | SessionModel + Store (versioned) | save/load bundle, migration | §5 | round-trip + migrate |
+| S9 | GUI shell + GPU meters + disk-time | track list, meters, Dark/Light | §11 | 32–128ch @60Hz no-alloc |
+| S10 | **M1 soak + harden** | wire SLO gates; multi-hour 32ch soak | §16, §18 | **M1 DoD (G1/G2/G4/G5)** |
+| S11 | TimeAuthority + LTC core | decode 7 rates + TimeReference + ToD fallback | §8 | LTC corpus exact (G3) |
+| S12 | Metadata + bext/iXML | field model + embedding | §9 | BWF MetaEdit/iXML valid |
+| S13 | NamingEngine + Markers + keyboard | tokens/preview + TC markers + CSV | §10, markers | property + CSV round-trip |
+| S14 | **M2 soak + MVP cert** | full MVP DoD + certification report | §16, §18, §19 | **MVP gates green** |
+| … | M3→M5 sessions | one module per session per the dependency map | resp. sections | per-milestone validation |
+
+**Drift guards across sessions:** (1) interfaces are the contract — change them only in a dedicated "interface change" session that updates dependents; (2) every session re-states the relevant SLO/gate it must not regress; (3) `progress.md` + commits are the source of truth between sessions; (4) never let a feature session weaken a Tier-0 invariant — if tempted, stop and open a design note instead.
+
+---
+
+## PART II Status
+Execution plan complete: feature triage, realistic MVP (= M1+M2), 5-milestone roadmap, module dependency map, repo structure, testing plan, first coding milestone (M0), and a 15+ session Claude Code build sequence. Honors the user's MVP capability list while keeping reliability first. Still **no code**. Confidence-monitoring scope **resolved → M5** (MVP metering-only).
+
+---
+---
+---
+
+# PART III — S0 IMPLEMENTATION BRIEF (M0 Foundation Slice)
+
+> **Scope:** S0 == the M0 foundation slice. The smallest independently testable foundation that locks in the architecture **before any CoreAudio or UI**. **No code in this brief.** Implementation begins only after scope approval, using the prompt in §10 below.
+>
+> **Stack baseline:** C++20, CMake ≥ 3.24, clang (Apple Silicon), GoogleTest + CTest, FetchContent for deps. Sanitizers via build options. **Zero JUCE / zero UI** in S0.
+
+## 1. Exact S0 Goals
+- **G-S0.1** A CMake project producing a pure C++20 static lib **`recorder_engine`** (no JUCE, no UI, no platform-audio API) plus a **`recorder_tests`** target wired into CTest.
+- **G-S0.2** **Platform abstraction interfaces** (audio device, clock, file sink) with **deterministic mock implementations** — no real hardware/OS audio.
+- **G-S0.3** A **lock-free SPSC ring buffer** (audio FIFO) with correct acquire/release memory ordering, fixed-capacity, allocation-free in steady state.
+- **G-S0.4** An **RT-safety guard**: debug instrumentation that flags heap allocation occurring while a thread is in "real-time context"; compiled out in release.
+- **G-S0.5** A **minimal audio file writer**: WAV (canonical) with **automatic RF64 promotion** at the 4 GB threshold; supports **mono (one file/track)** and **polyphonic (interleaved)**; sample format = **32-bit float** for S0.
+- **G-S0.6** A **headless mock audio device** that synthesizes a deterministic, verifiable signal and drives a render callback, with a **synchronous pump mode** (test-driven block count) and an optional **threaded mode** (for TSan stress).
+- **G-S0.7** A **mock-device → FIFO → writer → .wav integration test** asserting sample-accurate, gap-free output and a valid parsed header.
+- **G-S0.8** **ASan/UBSan and TSan** build configurations; all tests green under sanitizers in CI; headless and fast (< ~30 s).
+- **G-S0.9** A **CI-friendly structure** (headless build+test job(s); ffprobe-based golden validation where available).
+
+## 2. Non-Goals (explicitly out of S0)
+- No real **CoreAudio** / raw-HAL (that's S5). No **JUCE / GUI**.
+- No **LTC, metadata, BWF/iXML, naming, markers, sessions, recovery, telemetry dashboards**.
+- No **per-track delay/gain/bypass** processing — S0 capture is **pass-through** (processing path is a later session).
+- No **multi-thread writer pool tuning** — a **single writer/drain path** is sufficient for S0.
+- No **device hot-plug, sample-rate renegotiation, mirror, networking, exports**.
+- No **int16/int24 PCM** writer yet (32-bit float only in S0; int24 broadcast format is the next writer session).
+- No **128-channel performance tuning** — correctness at a modest count (e.g., 1–32 ch) is the bar; the path must be *architected* for scale, not optimized.
+
+## 3. Folder Structure (created/touched in S0)
+```
+recorder/
+├─ CMakeLists.txt
+├─ cmake/                       # sanitizers.cmake, warnings.cmake, deps.cmake
+├─ engine/
+│  ├─ CMakeLists.txt            # builds recorder_engine (static lib)
+│  ├─ rt/                       # SpscRingBuffer, RtGuard, rt context flag
+│  ├─ platform/                 # interfaces: IAudioDevice, IClock, IFileSink
+│  │  └─ mock/                  # MockAudioDevice, MockClock, MockFileSink/InMemory
+│  ├─ io/                       # WavWriter (+ RF64 promotion), audio format types
+│  └─ capture/                  # CapturePath (device→FIFO→writer wiring for S0)
+├─ tests/
+│  ├─ CMakeLists.txt            # recorder_tests (GoogleTest + CTest)
+│  ├─ unit/                     # ring buffer, wav header, rf64 threshold
+│  ├─ lockfree/                 # SPSC TSan stress
+│  ├─ rtguard/                  # guard self-test (planted allocation)
+│  ├─ integration/              # mock→FIFO→writer→wav
+│  └─ fixtures/                 # signal generators, wav/ffprobe helpers
+├─ tools/                       # (existing) md2html etc.
+├─ docs/                        # (existing planner) architecture/ + execution/
+└─ .github/workflows/ci.yml     # headless build + ASan/UBSan + TSan jobs
+```
+
+## 4. Files to Create (inventory — purpose only, no code)
+**Build:** `CMakeLists.txt` (top), `engine/CMakeLists.txt`, `tests/CMakeLists.txt`, `cmake/{sanitizers,warnings,deps}.cmake`, `.github/workflows/ci.yml`.
+**RT:** `rt/SpscRingBuffer.hpp` (fixed-capacity lock-free SPSC), `rt/RtContext.hpp` (thread-local in-RT flag + scope guard), `rt/RtGuard.hpp/.cpp` (operator new/delete override → violation counter when in-RT).
+**Platform interfaces:** `platform/IAudioDevice.hpp`, `platform/IClock.hpp`, `platform/IFileSink.hpp`, `platform/AudioFormat.hpp` (sample rate, channels, sample type, block size).
+**Mocks:** `platform/mock/MockAudioDevice.hpp/.cpp` (deterministic signal, pump + threaded modes), `platform/mock/MockClock.hpp`, `platform/mock/InMemoryFileSink.hpp/.cpp` (+ real-file sink for golden).
+**IO:** `io/WavWriter.hpp/.cpp` (WAV + RF64 promotion, mono/poly), `io/AudioFileTypes.hpp`.
+**Capture wiring:** `capture/CapturePath.hpp/.cpp` (device callback → ring buffer → drain → writer).
+**Tests:** `unit/SpscRingBufferTest`, `unit/WavWriterTest`, `unit/Rf64PromotionTest`, `lockfree/SpscStressTest`, `rtguard/RtGuardTest`, `integration/MockToWavTest`, `fixtures/SignalGen` + `fixtures/WavProbe`.
+
+## 5. Interfaces to Define (contracts, prose only)
+- **`AudioFormat`** — value type: `sampleRate`, `numChannels`, `sampleType` (float32 for S0), `maxBlockSize`. Immutable once a device starts.
+- **`IAudioDevice`** — `setCallback(renderFn)`, `start()`, `stop()`, `getFormat()`. Render signature delivers **non-interleaved** channel pointers + a frame count ≤ `maxBlockSize`. **Contract:** the render fn runs in **RT context**; it must not allocate/lock/block. Mock adds `pump(blocks)` (sync) and `runThread(blocks)` (async).
+- **`IClock`** — `nowSamples()` / `nowMonotonic()`; mock is fully controllable/deterministic. (Seeds the future TimeAuthority.)
+- **`IFileSink`** — `open(path)`, `write(bytes)`, `flush()`, `close()`, `bytesWritten()`. Implementations: real-file + in-memory (for header-byte assertions). Writers depend on `IFileSink`, not on the OS.
+- **`SpscRingBuffer<T>`** — fixed capacity at construction (no runtime alloc); `push(span)` / `pop(span)` returning counts; `availableToRead/Write()`; single-producer/single-consumer; explicit acquire/release ordering. **Contract:** `push` is RT-safe (producer = RT thread); `pop` runs on the drain/writer thread.
+- **`RtContext` / `RtGuard`** — `RtContextScope` sets the thread-local in-RT flag for the duration of the callback; `RtGuard` counts/asserts allocations while the flag is set. Release builds compile both to no-ops.
+- **`IAudioFileWriter` (WavWriter)** — `begin(format, path, mode=mono|poly)`, `writeBlock(channelData, frames)`, `finalize()`. **Contract:** chooses WAV vs RF64 header up front when size is projected ≥ threshold, and **promotes/patches to RF64 + ds64** when crossing 4 GB; finalize patches sizes so the file is valid.
+- **`CapturePath`** — composes `IAudioDevice` + `SpscRingBuffer` + writer: device render pushes to the ring (RT side); a drain step pops and writes (non-RT side). S0 drain may be pumped by the test for determinism.
+
+## 6. Tests to Write
+- **Unit — SpscRingBuffer:** empty/full, wrap-around, partial push/pop, capacity invariants, no allocation after construction.
+- **Unit — WavWriter:** byte-exact canonical WAV header (RIFF/fmt/data) for mono & poly float32; round-trip written samples == input; `flush`/`finalize` size fields correct.
+- **Unit — RF64 promotion:** with a **lowered threshold** (injected, not 4 GB of real data), confirm header becomes RF64 + `ds64` and remains valid; boundary just-below stays WAV.
+- **Lock-free — SPSC stress (TSan):** producer thread + consumer thread for N seconds/iterations; assert no data race, no lost/duplicated samples, FIFO never corrupts.
+- **RT-guard self-test:** a callback that **deliberately allocates** → guard reports a violation; the real capture callback → **zero** violations.
+- **Integration — MockToWav:** mock device emits a known signal (e.g., per-channel ramp/sine with channel-ID watermark) → CapturePath → WAV; reopen and assert **sample-accurate, gap-free, correct channel order** for both mono and poly; header parses; (where ffprobe present) **golden validation**.
+- **Determinism:** same seed ⇒ byte-identical output file.
+
+## 7. Acceptance Criteria
+- **A1** `cmake --build` produces `recorder_engine` + `recorder_tests` with **zero warnings** (warnings-as-errors) and **no JUCE/UI/OS-audio dependency** in the engine lib (verifiable by link inputs).
+- **A2** `ctest` — **all green** in normal, **ASan+UBSan**, and **TSan** configurations.
+- **A3** RT-guard: **0 violations** in the real capture path; **catches** the planted allocation in its self-test.
+- **A4** Integration test yields a **bit-exact, gap-free** WAV (mono + poly) matching the generated signal; header parses; ffprobe-valid where available.
+- **A5** RF64 promotion path produces a **valid RF64+ds64** header at the injected threshold; sub-threshold stays canonical WAV.
+- **A6** Runs **headless** in CI, no hardware, **< ~30 s** total; deterministic (seeded ⇒ identical bytes).
+- **A7** Public engine headers expose **only the S0 interfaces** above (no leakage of mock/impl details).
+
+## 8. Risks
+- **R-S0.1 SPSC memory-ordering bugs** → subtle data races. *Mitigate:* TSan stress + careful acquire/release; keep the API tiny.
+- **R-S0.2 RT-guard portability** (overriding global `operator new`/interposing malloc on macOS) → may miss some alloc routes or affect the test process broadly. *Mitigate:* thread-local in-RT flag scoping; guard only asserts when flag set; document limits; keep it debug-only.
+- **R-S0.3 RF64 header correctness** (ds64, size patching) → invalid files. *Mitigate:* in-memory sink byte assertions + ffprobe golden + threshold-injection test (avoid writing real 4 GB).
+- **R-S0.4 Mock-device threading vs determinism** → flaky tests. *Mitigate:* default **synchronous pump** for the integration test; threaded mode only for the TSan stress.
+- **R-S0.5 ASan+TSan can't combine** → must be **separate** build configs/CI jobs. *Mitigate:* two CMake presets/CI matrix entries.
+- **R-S0.6 ffprobe absent in CI** → golden step skipped. *Mitigate:* make golden validation conditional; keep byte-level header asserts as the always-on guarantee.
+- **R-S0.7 Float32-only now** could mask int24 issues later. *Accepted:* int24 writer is an explicit next session; S0 proves plumbing.
+
+## 9. Estimated Order of Implementation
+1. **CMake skeleton** (top + engine + tests targets, FetchContent GoogleTest, warnings-as-errors). *(S)*
+2. **Sanitizer presets** (ASan+UBSan config, TSan config) + a trivial passing test to prove CI. *(S)*
+3. **SpscRingBuffer** + unit tests. *(M)*
+4. **RtContext + RtGuard** + self-test. *(S–M)*
+5. **Platform interfaces** (`AudioFormat`, `IAudioDevice`, `IClock`, `IFileSink`). *(S)*
+6. **Mocks** (MockClock, InMemory/real FileSink, MockAudioDevice with pump + threaded). *(M)*
+7. **WavWriter** (canonical WAV mono/poly) + unit/header tests. *(M)*
+8. **RF64 promotion** + threshold-injection test. *(M)*
+9. **CapturePath** wiring + **MockToWav integration test** (mono + poly, determinism). *(M)*
+10. **SPSC TSan stress** + final **CI matrix** (normal/ASan/TSan, conditional ffprobe golden). *(M)*
+
+Rough total: **M (single focused implementation session)**; steps 3, 7, 8, 9 carry the real risk.
+
+## 10. Next Claude Code Prompt (paste after approving this scope)
+
+```
+Implement S0 / M0 (the foundation slice) exactly per PART III of
+docs/execution (the S0 Implementation Brief). No CoreAudio, no JUCE, no UI.
+
+Read first: PART III §§1–9, plus Part I §2 (firewall/planes), §6 (audio
+pipeline callback contract), §7 (WAV/RF64/crash-valid writer), and the
+repo-structure section.
+
+Build, in the order in §9:
+1. CMake project: recorder_engine (pure C++20 static lib, zero JUCE/UI/OS-audio
+   deps) + recorder_tests (GoogleTest via FetchContent, CTest), warnings-as-
+   errors, plus cmake/ presets for ASan+UBSan and TSan (separate configs).
+2. engine/rt: SpscRingBuffer<T> (fixed capacity, lock-free SPSC, acquire/release),
+   RtContext (thread-local in-RT flag + scope) and RtGuard (operator new/delete
+   override counting allocations while in-RT; no-op in release).
+3. engine/platform: interfaces AudioFormat, IAudioDevice, IClock, IFileSink, and
+   mocks (MockAudioDevice with pump() + runThread(), MockClock, InMemoryFileSink
+   + real-file sink).
+4. engine/io: WavWriter (canonical WAV, float32, mono + interleaved poly) with
+   automatic RF64+ds64 promotion at an injectable size threshold; finalize patches
+   sizes for a valid file.
+5. engine/capture: CapturePath wiring device-render → SpscRingBuffer → drain →
+   WavWriter (drain pump-able by tests).
+
+Write all tests in §6 and meet every acceptance criterion in §7:
+- ctest green in normal, ASan+UBSan, and TSan configs
+- RtGuard: 0 violations in the capture path; catches a planted allocation
+- MockToWav integration: bit-exact, gap-free WAV (mono + poly), header parses,
+  ffprobe-valid where available; seeded ⇒ identical bytes
+- RF64 promotion valid at the injected threshold
+
+Honor the firewall: nothing in the render callback allocates/locks/blocks.
+Keep public engine headers limited to the S0 interfaces.
+
+When done: ensure all sanitizer configs pass, then STOP — do not add features
+beyond S0. Append a 3-line entry to docs/execution/progress.md (what changed /
+tests status / next = S5 real CoreAudio). Do NOT commit unless I ask.
+```
+
+## PART III Status
+S0/M0 brief complete: goals, non-goals, folders, file inventory, interface contracts, tests, acceptance criteria, risks, implementation order, and the ready-to-run next prompt. Awaiting scope approval before any code.
